@@ -313,10 +313,14 @@ export class GithubAppService {
     }
   }
 
-  getInstallUrl(teamId: string): string {
+  getInstallUrl(teamId: string, userId?: string): string {
     const appSlug = process.env.GITHUB_APP_SLUG || 'kh-cloud-app';
     const secret = process.env.JWT_SECRET || 'fallback_secret_for_hmac';
-    const payload = JSON.stringify({ teamId, exp: Date.now() + 15 * 60 * 1000 });
+    const payload = JSON.stringify({
+      teamId,
+      userId: userId || null,
+      exp: Date.now() + 15 * 60 * 1000,
+    });
     const hmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
     const stateObj = { payload, hmac };
     const state = Buffer.from(JSON.stringify(stateObj)).toString('base64url');

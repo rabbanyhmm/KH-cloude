@@ -120,28 +120,21 @@ export default function Home() {
       };
 
       const saveInstallation = async () => {
-        if (!teamId) {
-          finishAndCloseOrResume(
-            false,
-            'Install session expired. You can close this window and click Refresh in KH Cloud.',
-          );
-          return;
-        }
+        const stateFromParam = params.get('state') || '';
+        const pendingTeamId = localStorage.getItem('github_app_pending_teamId') || '';
 
-        const state = btoa(JSON.stringify({ teamId }))
-          .replace(/\+/g, '-')
-          .replace(/\//g, '_')
-          .replace(/=+$/, '');
+        // Use GitHub returned state if present; otherwise fallback to encoded teamId
+        const stateToSend = stateFromParam || (pendingTeamId ? btoa(JSON.stringify({ teamId: pendingTeamId })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') : '');
 
-        const apiBase = getApiBase().replace(/\/api$/, '');
-        const url = `${apiBase}/api/github-app/callback?installation_id=${encodeURIComponent(installationId)}&state=${encodeURIComponent(state)}`;
+        const queryParts = [
+          `installation_id=${encodeURIComponent(installationId)}`,
+          stateToSend ? `state=${encodeURIComponent(stateToSend)}` : '',
+          pendingTeamId ? `teamId=${encodeURIComponent(pendingTeamId)}` : '',
+          'format=json',
+        ].filter(Boolean);
 
         try {
-          const res = await fetch(url);
-          if (!res.ok) {
-            const body = await res.json().catch(() => ({}));
-            throw new Error(body.message || `Callback failed (${res.status})`);
-          }
+          await apiRequest(`/github-app/callback?${queryParts.join('&')}`);
           finishAndCloseOrResume(true, 'GitHub App connected successfully!');
         } catch (err: any) {
           console.error('GitHub App callback failed:', err);

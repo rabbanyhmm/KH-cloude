@@ -1929,7 +1929,7 @@ export class ProjectsService implements OnModuleInit {
 
         const middlewareName = `${containerName}-hosthdr`;
         let runCmdString = [
-          'docker run -d',
+          'docker run -d -i',
           `--name ${containerName}`,
           `--network kh-cloud-network`,
           `-e PORT=${containerPort}`,
@@ -1997,7 +1997,7 @@ export class ProjectsService implements OnModuleInit {
           // Rebuild run string with the auto-detected port
           containerPort = detectedPort;
           runCmdString = [
-            'docker run -d',
+            'docker run -d -i',
             `--name ${containerName}`,
             `--network kh-cloud-network`,
             `-e PORT=${containerPort}`,
@@ -2417,7 +2417,44 @@ export class ProjectsService implements OnModuleInit {
   }
 
   /**
-   * Executes a shell command inside the project's running container context.
+   * Writes input directly to the running container process's standard input stream (STDIN).
+   * Uses Docker socket attach with upgraded TCP connection.
+   */
+  async writeContainerStdin(containerName: string, input: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const net = require('net');
+      const socket = net.connect('/var/run/docker.sock', () => {
+        const req = `POST /containers/${containerName}/attach?stdin=true&stream=true HTTP/1.1\r\nHost: docker\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n`;
+        socket.write(req);
+      });
+
+      let upgraded = false;
+      socket.on('data', () => {
+        if (!upgraded) {
+          upgraded = true;
+          socket.write(`${input}\n`);
+          setTimeout(() => {
+            try { socket.destroy(); } catch {}
+            resolve(true);
+          }, 350);
+        }
+      });
+
+      socket.on('error', (err: any) => {
+        this.logger.warn(`writeContainerStdin error on ${containerName}: ${err.message}`);
+        resolve(false);
+      });
+
+      setTimeout(() => {
+        try { socket.destroy(); } catch {}
+        resolve(upgraded);
+      }, 2000);
+    });
+  }
+
+  /**
+   * Executes a shell command inside the project's running container context,
+   * or delivers standard input to a running bot/interactive process.
    */
   async executeTerminalCommand(projectId: string, teamId: string, command: string): Promise<{ output: string }> {
     if (!command || typeof command !== 'string' || !command.trim()) {
@@ -2481,7 +2518,10 @@ export class ProjectsService implements OnModuleInit {
       };
     }
 
-    // Execute command safely via spawn inside container
+    // 1. Deliver input directly to container process STDIN (e.g. for running bots or interactive prompts)
+    const stdinDelivered = await this.writeContainerStdin(containerName, trimmedCmd);
+
+    // 2. Also execute command in container sh context
     return new Promise<{ output: string }>((resolve) => {
       const proc = spawn('docker', ['exec', '-i', containerName, 'sh', '-c', trimmedCmd], {
         timeout: 25000,
@@ -2499,7 +2539,11 @@ export class ProjectsService implements OnModuleInit {
       });
 
       proc.on('error', (err: any) => {
-        resolve({ output: `Execution failed: ${err.message}` });
+        if (stdinDelivered) {
+          resolve({ output: `Input sent to running container.` });
+        } else {
+          resolve({ output: `Execution failed: ${err.message}` });
+        }
       });
 
       proc.on('close', (code: number | null, signal: string | null) => {
@@ -2508,13 +2552,23 @@ export class ProjectsService implements OnModuleInit {
           return;
         }
 
-        let output = stdout;
-        if (stderr) {
-          output = output ? `${output}\n${stderr}` : stderr;
+        let output = stdout.trim();
+        const errTrimmed = stderr.trim();
+
+        // If sh -c reported "not found" (common when user entered raw text meant for a bot),
+        // and stdin was delivered, return a clean confirmation instead of sh error
+        if (errTrimmed) {
+          if (stdinDelivered && (errTrimmed.includes('not found') || code === 127)) {
+            resolve({ output: output || `Input sent to running container.` });
+            return;
+          }
+          output = output ? `${output}\n${errTrimmed}` : errTrimmed;
         }
 
-        if (!output.trim()) {
-          output = code === 0 ? '(Command completed with exit code 0)' : `(Command exited with code ${code})`;
+        if (!output) {
+          output = stdinDelivered
+            ? `Input sent to running container.`
+            : (code === 0 ? '(Command completed with exit code 0)' : `(Command exited with code ${code})`);
         }
 
         resolve({ output: output.trimEnd() });

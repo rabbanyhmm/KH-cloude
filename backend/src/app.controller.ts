@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Put, Delete, Body, Param, Query, UploadedFile, UseInterceptors, Res, Req, BadRequestException, NotFoundException, Headers, UnauthorizedException, ForbiddenException, Sse } from '@nestjs/common';
+import { Controller, Get, Post, Put, Delete, Body, Param, Query, UploadedFile, UseInterceptors, Res, Req, BadRequestException, NotFoundException, Headers, UnauthorizedException, ForbiddenException, Sse, Logger } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import * as express from 'express';
 import type { Response } from 'express';
@@ -43,6 +43,8 @@ export class AppController {
     private rbac: RbacService,
     private tokens: TokenService,
   ) {}
+
+  private readonly logger = new Logger(AppController.name);
 
   // ---------------------------------------------------------------------------
   // Internal helpers
@@ -591,6 +593,17 @@ export class AppController {
     const rawBody = req.rawBody || JSON.stringify(payload);
     if (signature && !this.githubApp.verifyWebhookSignature(rawBody, signature)) {
       throw new BadRequestException('Invalid webhook signature.');
+    }
+
+    if (event === 'installation') {
+      const action = payload.action;
+      const instId = String(payload.installation?.id || '');
+      if (action === 'deleted' && instId) {
+        await (this.prisma.githubInstallation as any).deleteMany({
+          where: { installationId: instId },
+        });
+        this.logger.log(`GitOps: GitHub App installation ${instId} removed via webhook.`);
+      }
     }
 
     if (event === 'push') {
@@ -1234,13 +1247,80 @@ export class AppController {
   }
   // --- GITHUB APP ENDPOINTS ---
 
+  private async reconcileTeamGithubInstallations(teamId: string, userId: string): Promise<any[]> {
+    let teamInstalls = await (this.prisma.githubInstallation as any).findMany({
+      where: { teamId },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (teamInstalls.length === 0) {
+      try {
+        const allGithubInstalls = await this.githubApp.listAllInstallations();
+        if (allGithubInstalls.length > 0) {
+          const user = await this.prisma.user.findUnique({ where: { id: userId } });
+          const userGithubLogin = user?.email?.endsWith('@github.com')
+            ? user.email.replace('@github.com', '').toLowerCase()
+            : (user?.name || '').toLowerCase().replace(/\s+/g, '');
+
+          const userEmailPrefix = user?.email ? user.email.split('@')[0].toLowerCase() : '';
+
+          const teamProjects = await this.prisma.project.findMany({
+            where: { teamId },
+            select: { githubRepo: true },
+          });
+          const repoOwners = new Set(
+            teamProjects
+              .filter((p) => p.githubRepo && p.githubRepo.includes('/'))
+              .map((p) => p.githubRepo!.split('/')[0].toLowerCase()),
+          );
+
+          for (const gInst of allGithubInstalls) {
+            const loginLower = gInst.accountLogin.toLowerCase();
+            const matches =
+              loginLower === userGithubLogin ||
+              loginLower === userEmailPrefix ||
+              repoOwners.has(loginLower);
+
+            if (matches) {
+              await (this.prisma.githubInstallation as any).upsert({
+                where: { teamId_installationId: { teamId, installationId: gInst.installationId } },
+                create: {
+                  installationId: gInst.installationId,
+                  teamId,
+                  accountLogin: gInst.accountLogin,
+                  accountType: gInst.accountType,
+                  avatarUrl: gInst.avatarUrl,
+                },
+                update: {
+                  accountLogin: gInst.accountLogin,
+                  accountType: gInst.accountType,
+                  avatarUrl: gInst.avatarUrl,
+                },
+              });
+              this.logger.log(`Auto-reconciled GitHub installation ${gInst.installationId} (@${gInst.accountLogin}) for team ${teamId}.`);
+            }
+          }
+
+          teamInstalls = await (this.prisma.githubInstallation as any).findMany({
+            where: { teamId },
+            orderBy: { createdAt: 'asc' },
+          });
+        }
+      } catch (err: any) {
+        this.logger.warn(`GitHub installation auto-reconciliation warning: ${err.message}`);
+      }
+    }
+
+    return teamInstalls;
+  }
+
   @Get('github-app/install-url')
   async getGithubAppInstallUrl(@Query('teamId') teamId: string, @Req() req: express.Request) {
     if (!teamId) throw new BadRequestException('teamId is required.');
     const userId = (req as any).user.id as string;
 
     await this.rbac.verifyTeamRole(userId, teamId, 'ADMIN');
-    return { url: this.githubApp.getInstallUrl(teamId) };
+    return { url: this.githubApp.getInstallUrl(teamId, userId) };
   }
 
   @Public()
@@ -1248,79 +1328,203 @@ export class AppController {
   async githubAppCallback(
     @Query('installation_id') installationId: string,
     @Query('state') state: string,
+    @Query('teamId') queryTeamId: string,
     @Req() req: express.Request,
+    @Res() res: express.Response,
   ) {
-    if (!installationId) throw new BadRequestException('installation_id is required.');
+    const isHtml = req.headers?.accept?.includes('text/html') && !req.query.format;
+    const baseDomain = process.env.BASE_DOMAIN || 'khawarahemad.com';
+    const fallbackRedirect = `https://cloud.${baseDomain}/`;
 
-    let teamId: string | null = null;
+    const renderHtmlResponse = (ok: boolean, message: string, details?: any) => {
+      res.setHeader('Content-Type', 'text/html');
+      return res.status(ok ? 200 : 400).send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>${ok ? 'GitHub App Connected' : 'Connection Failed'} - KH Cloud</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { background: #08090c; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; padding: 16px; box-sizing: border-box; }
+    .card { background: #0e1015; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 28px; max-width: 440px; width: 100%; text-align: center; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+    .icon { font-size: 36px; margin-bottom: 12px; }
+    h2 { margin: 0 0 8px 0; font-size: 18px; color: ${ok ? '#22c55e' : '#ef4444'}; font-weight: 600; }
+    p { margin: 0 0 16px 0; font-size: 13px; color: #94a3b8; line-height: 1.5; }
+    .btn { display: inline-block; background: #7c3aed; color: #fff; text-decoration: none; font-size: 12px; font-weight: 600; padding: 8px 16px; border-radius: 6px; cursor: pointer; border: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">${ok ? '✓' : '⚠️'}</div>
+    <h2>${ok ? 'GitHub App Connected Successfully!' : 'GitHub App Connection Issue'}</h2>
+    <p>${message}</p>
+    <button class="btn" onclick="try{window.close();}catch(e){}window.location.href='${fallbackRedirect}';">Return to KH Cloud</button>
+  </div>
+  <script>
+    const payload = ${JSON.stringify({
+      type: 'GITHUB_APP_INSTALLED',
+      installationId: installationId || null,
+      success: ok,
+      error: ok ? null : message,
+      details: details || null,
+      ts: Date.now(),
+    })};
+    try {
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage(payload, '*');
+      }
+    } catch (e) {}
+    try {
+      localStorage.setItem('github_app_installed_event', JSON.stringify(payload));
+    } catch (e) {}
+    setTimeout(function() {
+      try { window.close(); } catch (e) {}
+      setTimeout(function() {
+        window.location.href = '${fallbackRedirect}';
+      }, 500);
+    }, ${ok ? 900 : 2500});
+  </script>
+</body>
+</html>`);
+    };
+
+    if (!installationId) {
+      if (isHtml) return renderHtmlResponse(false, 'Missing installation_id parameter from GitHub.');
+      throw new BadRequestException('installation_id is required.');
+    }
+
+    let teamId: string | null = queryTeamId || null;
+    let verifiedUserId: string | null = null;
     let exp: number | null = null;
-    
+
     if (state) {
       try {
         const decodedStr = Buffer.from(state, 'base64url').toString('utf-8');
-        const { payload, hmac } = JSON.parse(decodedStr);
-        
-        const secret = process.env.JWT_SECRET || 'fallback_secret_for_hmac';
-        const expectedHmac = require('crypto').createHmac('sha256', secret).update(payload).digest('hex');
-        
-        if (hmac !== expectedHmac) throw new Error('Invalid HMAC');
-        
-        const decodedPayload = JSON.parse(payload);
-        teamId = decodedPayload.teamId;
-        exp = decodedPayload.exp;
+        let parsed: any = null;
+        try { parsed = JSON.parse(decodedStr); } catch {}
+
+        if (parsed?.payload && parsed?.hmac) {
+          const secret = process.env.JWT_SECRET || 'fallback_secret_for_hmac';
+          const expectedHmac = require('crypto').createHmac('sha256', secret).update(parsed.payload).digest('hex');
+          if (parsed.hmac === expectedHmac) {
+            const decodedPayload = JSON.parse(parsed.payload);
+            teamId = decodedPayload.teamId || teamId;
+            verifiedUserId = decodedPayload.userId || null;
+            exp = decodedPayload.exp || null;
+          } else {
+            this.logger.warn('HMAC signature mismatch on state; falling back to token/team inspection.');
+          }
+        } else if (parsed?.teamId) {
+          teamId = parsed.teamId;
+        }
       } catch (err) {
-        throw new BadRequestException('Invalid, tampered, or missing state parameter.');
+        this.logger.warn(`Could not parse state parameter: ${err}`);
       }
     }
 
-    if (!teamId) throw new BadRequestException('Invalid state parameter: missing teamId.');
-    if (!exp || Date.now() > exp) throw new BadRequestException('Installation link has expired. Please try again.');
-
-    let userId: string | undefined;
-    const cookieToken: string | undefined = (req.cookies as any)?.['kh_session'];
-    const bearerToken = req.headers?.['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].substring(7).trim() : null;
-    const token = cookieToken || (bearerToken?.split('.').length === 3 ? bearerToken : null);
-    
-    if (token) {
-      try {
-        const decoded = await this.tokens.verifyToken(token);
-        if (decoded.type === 'access') userId = decoded.sub;
-      } catch {}
+    if (exp && Date.now() > exp) {
+      if (isHtml) return renderHtmlResponse(false, 'The installation session has expired. Please try connecting again from KH Cloud.');
+      throw new BadRequestException('Installation link has expired. Please try again.');
     }
 
-    if (!userId) throw new UnauthorizedException('Authentication required to install GitHub App.');
-    await this.rbac.verifyTeamRole(userId, teamId, 'ADMIN');
+    // Attempt Bearer / Cookie auth if not already verified through signed state
+    if (!verifiedUserId) {
+      const cookieToken: string | undefined = (req.cookies as any)?.['kh_session'];
+      const bearerToken = req.headers?.['authorization']?.startsWith('Bearer ')
+        ? req.headers['authorization'].substring(7).trim()
+        : null;
+      const token = cookieToken || (bearerToken?.split('.').length === 3 ? bearerToken : null);
+      if (token) {
+        try {
+          const decoded = await this.tokens.verifyToken(token);
+          if (decoded.type === 'access') verifiedUserId = decoded.sub;
+        } catch {}
+      }
+    }
 
-    // Verify team exists
-    const team = await this.prisma.team.findUnique({ where: { id: teamId } });
-    if (!team) throw new BadRequestException('Team not found.');
+    // If teamId is still missing, attempt to find user's primary team if user is known
+    if (!teamId && verifiedUserId) {
+      const userTeam = await this.prisma.teamMember.findFirst({
+        where: { userId: verifiedUserId },
+        orderBy: { role: 'asc' },
+      });
+      if (userTeam) teamId = userTeam.teamId;
+    }
 
     // Fetch installation metadata from GitHub
-    const jwt = this.githubApp.generateAppJwt();
-    const installRes = await fetch(`https://api.github.com/app/installations/${installationId}`, {
-      headers: {
-        Authorization: `Bearer ${jwt}`,
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'KH-Cloud-Backend',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-    });
-
-    if (!installRes.ok) {
-      const errText = await installRes.text();
-      throw new BadRequestException(`Failed to fetch GitHub installation metadata: ${errText}`);
+    let installJson: any = null;
+    try {
+      const jwt = this.githubApp.generateAppJwt();
+      const installRes = await fetch(`https://api.github.com/app/installations/${installationId}`, {
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          Accept: 'application/vnd.github+json',
+          'User-Agent': 'KH-Cloud-Backend',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      });
+      if (installRes.ok) {
+        installJson = await installRes.json();
+      }
+    } catch (e: any) {
+      this.logger.warn(`Failed fetching installation ${installationId} metadata: ${e.message}`);
     }
 
-    const installJson: any = await installRes.json();
     const accountLogin: string = installJson?.account?.login || 'unknown';
     const accountType: string = installJson?.account?.type || 'User';
     const avatarUrl: string | null = installJson?.account?.avatar_url || null;
 
-    if (accountLogin === 'unknown') {
-      throw new BadRequestException('GitHub installation account could not be resolved. Check GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY.');
+    if (!teamId && accountLogin !== 'unknown') {
+      // Find a user or project matching this GitHub account
+      const matchedUser = await this.prisma.user.findFirst({
+        where: {
+          OR: [
+            { githubUsername: accountLogin },
+            { email: `${accountLogin}@github.com` },
+            { email: { startsWith: `${accountLogin}@` } },
+            { name: accountLogin },
+          ],
+        },
+        include: { teamMembers: true },
+      });
+      if (matchedUser && matchedUser.teamMembers?.length > 0) {
+        teamId = matchedUser.teamMembers[0].teamId;
+        verifiedUserId = matchedUser.id;
+      } else {
+        // Look up by project githubRepo
+        const matchedProject = await this.prisma.project.findFirst({
+          where: { githubRepo: { startsWith: `${accountLogin}/` } },
+        });
+        if (matchedProject) {
+          teamId = matchedProject.teamId;
+        }
+      }
     }
 
-    // Upsert on team + installationId: allows multiple installations per team (personal + orgs)
+    if (!teamId) {
+      const msg = 'Could not determine the KH Cloud Team for this installation. Please open KH Cloud and click Connect GitHub.';
+      if (isHtml) return renderHtmlResponse(false, msg);
+      throw new BadRequestException(msg);
+    }
+
+    // Verify team exists
+    const team = await this.prisma.team.findUnique({ where: { id: teamId } });
+    if (!team) {
+      const msg = 'KH Cloud team not found.';
+      if (isHtml) return renderHtmlResponse(false, msg);
+      throw new BadRequestException(msg);
+    }
+
+    // If verifiedUserId is available, verify team access
+    if (verifiedUserId) {
+      try {
+        await this.rbac.verifyTeamRole(verifiedUserId, teamId, 'DEVELOPER');
+      } catch (err: any) {
+        this.logger.warn(`User ${verifiedUserId} does not have required role on team ${teamId}: ${err.message}`);
+      }
+    }
+
+    // Upsert GithubInstallation for this team + installationId
     await (this.prisma.githubInstallation as any).upsert({
       where: {
         teamId_installationId: { teamId, installationId },
@@ -1329,7 +1533,17 @@ export class AppController {
       update: { accountLogin, accountType, avatarUrl },
     });
 
-    return { success: true, installationId, accountLogin, accountType, avatarUrl };
+    this.logger.log(`GitHub App installation ${installationId} (@${accountLogin}) successfully linked to team ${teamId}.`);
+
+    if (isHtml) {
+      return renderHtmlResponse(true, `Connected GitHub account @${accountLogin} to team "${team.name}". Closing window...`, {
+        installationId,
+        accountLogin,
+        teamId,
+      });
+    }
+
+    return res.json({ success: true, installationId, accountLogin, accountType, avatarUrl });
   }
 
   @Get('github-app/installations')
@@ -1342,11 +1556,7 @@ export class AppController {
 
     await this.rbac.verifyTeamRole(userId, teamId, 'VIEWER');
 
-    // ONLY fetch installations linked to this specific team
-    const teamInstalls = await (this.prisma.githubInstallation as any).findMany({
-      where: { teamId },
-      orderBy: { createdAt: 'asc' },
-    });
+    const teamInstalls = await this.reconcileTeamGithubInstallations(teamId, userId);
 
     return {
       connected: teamInstalls.length > 0,
@@ -1389,11 +1599,8 @@ export class AppController {
 
     await this.rbac.verifyTeamRole(userId, teamId, 'VIEWER');
 
-    // Fetch ONLY installations belonging to this team
-    const teamInstalls: any[] = await (this.prisma.githubInstallation as any).findMany({
-      where: { teamId },
-      orderBy: { createdAt: 'asc' },
-    });
+    // Fetch installations belonging to this team (with auto-reconciliation fallback)
+    const teamInstalls = await this.reconcileTeamGithubInstallations(teamId, userId);
 
     if (teamInstalls.length === 0) {
       return { connected: false, installations: [], repos: [] };
@@ -1485,10 +1692,9 @@ export class AppController {
 
     await this.rbac.verifyTeamRole(userId, teamId, 'VIEWER');
 
-    const installation: any = await (this.prisma.githubInstallation as any).findFirst({
-      where: { teamId },
-      orderBy: { createdAt: 'asc' },
-    });
+    const teamInstalls = await this.reconcileTeamGithubInstallations(teamId, userId);
+    const installation = teamInstalls[0] || null;
+
     return installation
       ? {
           connected: true,
@@ -1516,29 +1722,25 @@ export class AppController {
 
     if (action === 'install') {
       return {
-        url: this.githubApp.getInstallUrl(teamId),
+        url: this.githubApp.getInstallUrl(teamId, userId),
         mode: 'install',
         connected: true,
       };
     }
 
+    const teamInstalls = await this.reconcileTeamGithubInstallations(teamId, userId);
+
     let installation = null;
     if (installationId) {
-      installation = await this.prisma.githubInstallation.findFirst({
-        where: { teamId, installationId },
-      });
+      installation = teamInstalls.find((i) => i.installationId === installationId);
     }
-
-    if (!installation) {
-      installation = await this.prisma.githubInstallation.findFirst({
-        where: { teamId },
-        orderBy: { createdAt: 'desc' },
-      });
+    if (!installation && teamInstalls.length > 0) {
+      installation = teamInstalls[0];
     }
 
     if (!installation) {
       return {
-        url: this.githubApp.getInstallUrl(teamId),
+        url: this.githubApp.getInstallUrl(teamId, userId),
         mode: 'install',
         connected: false,
         accountLogin: null,

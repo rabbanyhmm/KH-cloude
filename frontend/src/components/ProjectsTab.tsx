@@ -153,8 +153,8 @@ export default function ProjectsTab() {
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<string[]>([
     'Welcome to KH Cloud Interactive Terminal.',
-    'Commands are executed directly inside your running container context.',
-    'Try typing: ls -la, python --version, or /help',
+    'Commands and input are sent directly into your running container context.',
+    'Try typing: ls -la, env, or enter input for your running bot.',
     ''
   ]);
   const [terminalRunning, setTerminalRunning] = useState(false);
@@ -2155,7 +2155,7 @@ export default function ProjectsTab() {
                           type="text"
                           value={consoleInput}
                           onChange={(e) => setConsoleInput(e.target.value)}
-                          placeholder="Type command or slash shortcut (/help, /restart, /status, /clear, ls -la, env)..."
+                          placeholder="Enter command or input to running container..."
                           disabled={consoleRunning}
                           style={{
                             flex: 1,
@@ -2167,35 +2167,7 @@ export default function ProjectsTab() {
                             outline: 'none',
                           }}
                         />
-                        {/* Quick Command Shortcut Buttons */}
                         <div style={{ display: 'flex', alignItems: 'center', gap: '5px', flexShrink: 0 }}>
-                          {[
-                            { label: '/help', cmd: '/help' },
-                            { label: '/status', cmd: '/status' },
-                            { label: '/restart', cmd: '/restart' },
-                            { label: '/clear', cmd: '/clear' },
-                          ].map((shortcut) => (
-                            <button
-                              key={shortcut.label}
-                              type="button"
-                              onClick={() => void executeUnifiedCommand(shortcut.cmd, 'logs')}
-                              disabled={consoleRunning}
-                              style={{
-                                padding: '2px 8px',
-                                borderRadius: '4px',
-                                backgroundColor: 'rgba(255,255,255,0.04)',
-                                border: '1px solid rgba(255,255,255,0.08)',
-                                color: '#94a3b8',
-                                fontSize: '10px',
-                                fontFamily: 'monospace',
-                                cursor: 'pointer',
-                                transition: 'all 0.12s',
-                              }}
-                              className="hover:bg-violet-600/20 hover:text-violet-300 hover:border-violet-500/40"
-                            >
-                              {shortcut.label}
-                            </button>
-                          ))}
                           <button
                             type="submit"
                             disabled={!consoleInput.trim() || consoleRunning}
@@ -2214,7 +2186,7 @@ export default function ProjectsTab() {
                               transition: 'all 0.12s',
                             }}
                           >
-                            Run ↵
+                            Send ↵
                           </button>
                         </div>
                       </form>
@@ -2237,30 +2209,27 @@ export default function ProjectsTab() {
                         <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#ef4444' }} />
                         <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#f59e0b' }} />
                         <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#22c55e' }} />
-                        <span style={{ fontSize: '11px', color: '#4b5563', marginLeft: '8px', fontFamily: 'monospace' }}>container shell</span>
+                        <span style={{ fontSize: '11px', color: '#4b5563', marginLeft: '8px', fontFamily: 'monospace' }}>container terminal</span>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                        {['/help', '/status', '/restart', '/clear'].map((shortcut) => (
-                          <button
-                            key={shortcut}
-                            type="button"
-                            onClick={() => void executeUnifiedCommand(shortcut, 'terminal')}
-                            disabled={terminalRunning}
-                            style={{
-                              padding: '1px 6px',
-                              borderRadius: '4px',
-                              backgroundColor: 'rgba(255,255,255,0.04)',
-                              border: '1px solid rgba(255,255,255,0.08)',
-                              color: '#94a3b8',
-                              fontSize: '10px',
-                              fontFamily: 'monospace',
-                              cursor: 'pointer',
-                            }}
-                            className="hover:bg-violet-600/20 hover:text-violet-300"
-                          >
-                            {shortcut}
-                          </button>
-                        ))}
+                        <button
+                          type="button"
+                          onClick={() => setTerminalHistory(['$ clear', ''])}
+                          disabled={terminalRunning}
+                          style={{
+                            padding: '1px 8px',
+                            borderRadius: '4px',
+                            backgroundColor: 'rgba(255,255,255,0.04)',
+                            border: '1px solid rgba(255,255,255,0.08)',
+                            color: '#94a3b8',
+                            fontSize: '10px',
+                            fontFamily: 'monospace',
+                            cursor: 'pointer',
+                          }}
+                          className="hover:bg-violet-600/20 hover:text-violet-300"
+                        >
+                          clear
+                        </button>
                       </div>
                     </div>
                     <div ref={terminalScrollRef} style={{ flex: 1, padding: '12px 16px', overflowY: 'auto', fontFamily: '"JetBrains Mono", "Fira Code", monospace', fontSize: '12px', lineHeight: 1.7 }}>
@@ -2273,8 +2242,24 @@ export default function ProjectsTab() {
                     </div>
                     <form onSubmit={handleTerminalSubmit} style={{ display: 'flex', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.06)', padding: '8px 14px', backgroundColor: '#0a0b0e', gap: '8px' }}>
                       <span style={{ color: '#22c55e', fontFamily: 'monospace', fontSize: '13px', fontWeight: 700, userSelect: 'none' }}>❯</span>
-                      <input type="text" value={terminalInput} onChange={e => setTerminalInput(e.target.value)} placeholder="Type shell command or /help, /status, /restart, /clear..." disabled={terminalRunning}
+                      <input type="text" value={terminalInput} onChange={e => setTerminalInput(e.target.value)} placeholder="Type shell command or input to running container..." disabled={terminalRunning}
                         style={{ flex: 1, backgroundColor: 'transparent', border: 'none', outline: 'none', color: '#e2e8f0', fontFamily: '"JetBrains Mono", "Fira Code", monospace', fontSize: '12px' }} />
+                      <button
+                        type="submit"
+                        disabled={!terminalInput.trim() || terminalRunning}
+                        style={{
+                          padding: '4px 10px',
+                          borderRadius: '6px',
+                          backgroundColor: terminalInput.trim() && !terminalRunning ? '#7c3aed' : 'rgba(255,255,255,0.05)',
+                          border: 'none',
+                          color: terminalInput.trim() && !terminalRunning ? '#fff' : '#4b5563',
+                          fontSize: '11px',
+                          fontWeight: 600,
+                          cursor: terminalInput.trim() && !terminalRunning ? 'pointer' : 'default',
+                        }}
+                      >
+                        Send ↵
+                      </button>
                     </form>
                   </div>
                 </div>
