@@ -2415,4 +2415,110 @@ export class ProjectsService implements OnModuleInit {
 
     log(`[Cleanup] Storage and cache cleanup complete.`);
   }
+
+  /**
+   * Executes a shell command inside the project's running container context.
+   */
+  async executeTerminalCommand(projectId: string, teamId: string, command: string): Promise<{ output: string }> {
+    if (!command || typeof command !== 'string' || !command.trim()) {
+      return { output: 'No command provided.' };
+    }
+
+    const trimmedCmd = command.trim();
+
+    if (trimmedCmd === 'clear') {
+      return { output: '' };
+    }
+
+    const project = await this.prisma.project.findFirst({
+      where: { id: projectId, teamId },
+    });
+    if (!project) {
+      throw new NotFoundException('Project not found.');
+    }
+
+    const cleanSlug = project.slug.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const containerName = `kh-cloud-app-${cleanSlug}-${project.id.substring(0, 8)}`;
+
+    // Inspect container state
+    const inspectRes = await new Promise<{ status: string; running: boolean; restarting: boolean }>((resolve) => {
+      exec(`docker inspect -f '{{.State.Status}} {{.State.Running}} {{.State.Restarting}}' ${containerName}`, { timeout: 4000 }, (err, stdout) => {
+        if (err || !stdout) {
+          resolve({ status: 'not_found', running: false, restarting: false });
+        } else {
+          const parts = stdout.trim().split(' ');
+          resolve({
+            status: parts[0] || 'unknown',
+            running: parts[1] === 'true',
+            restarting: parts[2] === 'true',
+          });
+        }
+      });
+    });
+
+    if (!inspectRes.running) {
+      if (inspectRes.restarting) {
+        // Fetch recent crash logs to help user debug directly in terminal
+        const recentLogs = await new Promise<string>((res) => {
+          exec(`docker logs --tail 8 ${containerName}`, { timeout: 3000 }, (err, stdout, stderr) => {
+            res((stdout || stderr || '').trim());
+          });
+        });
+
+        return {
+          output: `⚠️ Container is currently in a restart loop (Status: restarting).\nCommands cannot execute while the container is restarting.\n\nRecent crash logs:\n${recentLogs || '(No logs recorded)'}\n\nTip: Check Environment Variables (e.g. database credentials) or the Logs tab to resolve startup errors.`,
+        };
+      }
+
+      if (inspectRes.status === 'not_found') {
+        return {
+          output: `Container "${containerName}" was not found. Please trigger a deployment first.`,
+        };
+      }
+
+      return {
+        output: `Container is currently stopped (Status: ${inspectRes.status}). Please restart or redeploy the project to run commands.`,
+      };
+    }
+
+    // Execute command safely via spawn inside container
+    return new Promise<{ output: string }>((resolve) => {
+      const proc = spawn('docker', ['exec', '-i', containerName, 'sh', '-c', trimmedCmd], {
+        timeout: 25000,
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout.on('data', (d: Buffer) => {
+        if (stdout.length < 200000) stdout += d.toString();
+      });
+
+      proc.stderr.on('data', (d: Buffer) => {
+        if (stderr.length < 200000) stderr += d.toString();
+      });
+
+      proc.on('error', (err: any) => {
+        resolve({ output: `Execution failed: ${err.message}` });
+      });
+
+      proc.on('close', (code: number | null, signal: string | null) => {
+        if (signal === 'SIGTERM') {
+          resolve({ output: 'Command timed out after 25 seconds.' });
+          return;
+        }
+
+        let output = stdout;
+        if (stderr) {
+          output = output ? `${output}\n${stderr}` : stderr;
+        }
+
+        if (!output.trim()) {
+          output = code === 0 ? '(Command completed with exit code 0)' : `(Command exited with code ${code})`;
+        }
+
+        resolve({ output: output.trimEnd() });
+      });
+    });
+  }
 }

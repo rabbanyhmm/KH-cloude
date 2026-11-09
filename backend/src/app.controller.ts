@@ -435,6 +435,18 @@ export class AppController {
     return this.projects.restartProject(id, body.teamId);
   }
 
+  @Post('projects/:id/terminal')
+  async executeProjectTerminalCommand(
+    @Param('id') id: string,
+    @Body() body: { command: string; teamId: string },
+    @Req() req: express.Request,
+  ) {
+    const userId = (req as any).user.id as string;
+
+    await this.rbac.verifyProjectAccess(userId, id, 'DEVELOPER');
+    return this.projects.executeTerminalCommand(id, body.teamId, body.command);
+  }
+
   @Post('projects/:id/rollback')
   async rollbackProject(
     @Param('id') id: string,

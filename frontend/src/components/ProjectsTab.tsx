@@ -714,6 +714,10 @@ export default function ProjectsTab() {
     if (!terminalInput.trim() || !activeProjectId || !activeTeam || terminalRunning) return;
     const cmd = terminalInput.trim();
     setTerminalInput('');
+    if (cmd.toLowerCase() === 'clear') {
+      setTerminalHistory([]);
+      return;
+    }
     setTerminalHistory(prev => [...prev, `$ ${cmd}`]);
     setTerminalRunning(true);
     try {
