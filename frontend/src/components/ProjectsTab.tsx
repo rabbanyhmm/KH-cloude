@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useAppStore } from '@/lib/store';
 import { apiRequest, getBaseDomain, getApiBase } from '@/lib/api';
 import { useTeamRole } from '@/lib/rbac';
@@ -145,11 +145,16 @@ export default function ProjectsTab() {
   const [logSearch, setLogSearch] = useState('');
   const [logsLoading, setLogsLoading] = useState(false);
   const [isLogStreaming, setIsLogStreaming] = useState(false);
+  const [consoleInput, setConsoleInput] = useState('');
+  const [consoleRunning, setConsoleRunning] = useState(false);
+  const logScrollRef = useRef<HTMLDivElement>(null);
+  const terminalScrollRef = useRef<HTMLDivElement>(null);
+
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<string[]>([
     'Welcome to KH Cloud Interactive Terminal.',
     'Commands are executed directly inside your running container context.',
-    'Try typing: ls -la, python --version, or env',
+    'Try typing: ls -la, python --version, or /help',
     ''
   ]);
   const [terminalRunning, setTerminalRunning] = useState(false);
@@ -709,28 +714,133 @@ export default function ProjectsTab() {
     };
   }, [activeProjectId, activeTeam?.id, detailsTab, accessToken]);
 
+  // Auto-scroll log and terminal windows as new output arrives
+  useEffect(() => {
+    if (logScrollRef.current) {
+      logScrollRef.current.scrollTop = logScrollRef.current.scrollHeight;
+    }
+  }, [runtimeLogs]);
+
+  useEffect(() => {
+    if (terminalScrollRef.current) {
+      terminalScrollRef.current.scrollTop = terminalScrollRef.current.scrollHeight;
+    }
+  }, [terminalHistory]);
+
+  const executeUnifiedCommand = async (rawCmd: string, target: 'logs' | 'terminal') => {
+    const cmd = rawCmd.trim();
+    if (!cmd || !activeProjectId || !activeTeam) return;
+
+    const append = (msg: string) => {
+      if (target === 'logs') {
+        setRuntimeLogs(prev => [...prev, msg]);
+      } else {
+        setTerminalHistory(prev => [...prev, msg]);
+      }
+    };
+
+    // 1. /clear or clear
+    if (cmd.toLowerCase() === '/clear' || cmd.toLowerCase() === 'clear') {
+      if (target === 'logs') setRuntimeLogs([]);
+      else setTerminalHistory([]);
+      return;
+    }
+
+    // 2. /help or help
+    if (cmd.toLowerCase() === '/help' || cmd.toLowerCase() === 'help') {
+      append(`[System] ⚡ KH Cloud Console & Shell Commands:
+  /help       - Show this command reference
+  /clear      - Clear the current output view
+  /restart    - Restart the live Docker container
+  /redeploy   - Trigger a fresh build & redeploy
+  /status     - Inspect real-time container metrics & state
+  /env        - List configured environment variables
+  <command>   - Run any shell command in container (e.g. ls -la, python --version, env)`);
+      return;
+    }
+
+    // 3. /restart
+    if (cmd.toLowerCase() === '/restart') {
+      append(`[System] 🔄 Restarting container for project "${projectDetails?.name || activeProjectId}"...`);
+      try {
+        await handleRestart();
+        append(`[System] ✓ Container restart initiated.`);
+      } catch (err: any) {
+        append(`[System] ❌ Restart failed: ${err.message || 'Error restarting container'}`);
+      }
+      return;
+    }
+
+    // 4. /redeploy
+    if (cmd.toLowerCase() === '/redeploy') {
+      append(`[System] 🚀 Triggering new deployment for project "${projectDetails?.name || activeProjectId}"...`);
+      try {
+        await handleDeploy();
+        append(`[System] ✓ Redeploy triggered. Track progress in Deployments tab.`);
+      } catch (err: any) {
+        append(`[System] ❌ Redeploy failed: ${err.message || 'Error triggering redeploy'}`);
+      }
+      return;
+    }
+
+    // 5. /status
+    if (cmd.toLowerCase() === '/status') {
+      const cleanSlug = (projectDetails?.slug || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const containerName = `kh-cloud-app-${cleanSlug}-${activeProjectId.substring(0, 8)}`;
+      append(`[System] 📊 Container Status:
+  Project: ${projectDetails?.name || activeProjectId}
+  Status: ${projectDetails?.status || 'UNKNOWN'}
+  Container: ${containerName}
+  Branch: ${projectDetails?.githubBranch || 'main'}
+  Domains: ${(projectDetails?.domains || []).map((d: any) => d.hostname).join(', ') || 'None'}
+  CPU: ${metrics?.live?.cpuPercent || '0%'} | Memory: ${metrics?.live?.memUsageMb || 0} MB / ${metrics?.live?.memLimitMb || 0} MB`);
+      return;
+    }
+
+    // 6. /env
+    if (cmd.toLowerCase() === '/env') {
+      const items = (envVars || []).map(v => `  ${v.key} = ${v.isSecret ? '••••••••' : v.value}`);
+      append(`[System] 🔑 Environment Variables (${items.length} total):\n${items.length ? items.join('\n') : '  (No environment variables configured)'}`);
+      return;
+    }
+
+    // 7. General Shell Command (e.g. ls -la, pwd, env, python, /sh <cmd>, etc.)
+    const execCmd = cmd.startsWith('/sh ') ? cmd.substring(4).trim() : cmd;
+    append(target === 'logs' ? `[Exec] $ ${execCmd}` : `$ ${execCmd}`);
+
+    if (target === 'logs') setConsoleRunning(true);
+    else setTerminalRunning(true);
+
+    try {
+      const res = await apiRequest(`/projects/${activeProjectId}/terminal`, {
+        method: 'POST',
+        body: JSON.stringify({ command: execCmd, teamId: activeTeam.id })
+      });
+      if (res.output) {
+        append(res.output);
+      }
+    } catch (err: any) {
+      append(`[Error] ${err.message || 'Failed to execute command'}`);
+    } finally {
+      if (target === 'logs') setConsoleRunning(false);
+      else setTerminalRunning(false);
+    }
+  };
+
   const handleTerminalSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!terminalInput.trim() || !activeProjectId || !activeTeam || terminalRunning) return;
     const cmd = terminalInput.trim();
     setTerminalInput('');
-    if (cmd.toLowerCase() === 'clear') {
-      setTerminalHistory([]);
-      return;
-    }
-    setTerminalHistory(prev => [...prev, `$ ${cmd}`]);
-    setTerminalRunning(true);
-    try {
-      const res = await apiRequest(`/projects/${activeProjectId}/terminal`, {
-        method: 'POST',
-        body: JSON.stringify({ command: cmd, teamId: activeTeam.id })
-      });
-      setTerminalHistory(prev => [...prev, res.output]);
-    } catch (err: any) {
-      setTerminalHistory(prev => [...prev, `Error: ${err.message || 'Failed to execute command'}`]);
-    } finally {
-      setTerminalRunning(false);
-    }
+    void executeUnifiedCommand(cmd, 'terminal');
+  };
+
+  const handleConsoleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!consoleInput.trim() || !activeProjectId || !activeTeam || consoleRunning) return;
+    const cmd = consoleInput.trim();
+    setConsoleInput('');
+    void executeUnifiedCommand(cmd, 'logs');
   };
 
   const handleConfigureSettings = async () => {
@@ -1966,57 +2076,148 @@ export default function ProjectsTab() {
                       </div>
                     </div>
 
-                    {/* Main Log Window */}
-                    <div
-                      style={{
-                        fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-                        fontSize: '12px',
-                        lineHeight: 1.7,
-                        backgroundColor: '#08090c',
-                        border: '1px solid rgba(255,255,255,0.06)',
-                        padding: '16px',
-                        borderRadius: '10px',
-                        maxHeight: '480px',
-                        minHeight: '260px',
-                        overflowY: 'auto',
-                        whiteSpace: 'pre-wrap',
-                        userSelect: 'text',
-                      }}
-                    >
-                      {filteredLogs.length === 0 ? (
-                        <div style={{ color: '#4b5563', textAlign: 'center', padding: '40px 0', fontSize: '12px' }}>
-                          No matching logs found.
+                    {/* Unified Console Container (Logs + Interactive Command Bar) */}
+                    <div style={{ backgroundColor: '#08090c', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '10px', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                      {/* Main Log Window */}
+                      <div
+                        ref={logScrollRef}
+                        style={{
+                          fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                          fontSize: '12px',
+                          lineHeight: 1.7,
+                          padding: '16px',
+                          maxHeight: '440px',
+                          minHeight: '260px',
+                          overflowY: 'auto',
+                          whiteSpace: 'pre-wrap',
+                          userSelect: 'text',
+                        }}
+                      >
+                        {filteredLogs.length === 0 ? (
+                          <div style={{ color: '#4b5563', textAlign: 'center', padding: '40px 0', fontSize: '12px' }}>
+                            No matching logs found.
+                          </div>
+                        ) : (
+                          filteredLogs.map((line, idx) => {
+                            const isHttp = line.startsWith('[HTTP ') || line.startsWith('[HTTP]');
+                            const isSystem = line.startsWith('[System]');
+                            const isExec = line.startsWith('[Exec]');
+                            const isErr = !isHttp && !isSystem && (/error|exception|fail|crash|fatal/i.test(line));
+                            const isWarn = !isHttp && !isSystem && (/warn|warning/i.test(line));
+
+                            let color = '#9ba3af';
+                            if (isExec) color = '#c4b5fd';
+                            else if (isSystem) color = '#38bdf8';
+                            else if (isErr) color = '#f87171';
+                            else if (isWarn) color = '#fbbf24';
+                            else if (isHttp) {
+                              if (/-> 5\d\d/.test(line)) color = '#ef4444';
+                              else if (/-> 4\d\d/.test(line)) color = '#fbbf24';
+                              else if (/-> 2\d\d|-> 3\d\d/.test(line)) color = '#22c55e';
+                              else color = '#a78bfa';
+                            }
+
+                            return (
+                              <div key={idx} style={{ color, display: 'flex', gap: '8px', alignItems: 'baseline' }}>
+                                <span style={{ color: '#374151', fontSize: '10px', userSelect: 'none', minWidth: '28px', textAlign: 'right' }}>
+                                  {idx + 1}
+                                </span>
+                                <span style={{ flex: 1, wordBreak: 'break-word', fontWeight: isExec ? 600 : 400 }}>
+                                  {line}
+                                </span>
+                              </div>
+                            );
+                          })
+                        )}
+                        {consoleRunning && (
+                          <div style={{ color: '#a78bfa', display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 0 0 36px', fontSize: '11px' }}>
+                            <Loader2 size={11} className="animate-spin" /> Executing command in container...
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Interactive Console Command Input Bar */}
+                      <form
+                        onSubmit={handleConsoleSubmit}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          borderTop: '1px solid rgba(255,255,255,0.06)',
+                          padding: '8px 12px',
+                          backgroundColor: '#0d0f14',
+                          gap: '10px',
+                        }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#22c55e', fontFamily: 'monospace', fontSize: '13px', fontWeight: 700, userSelect: 'none' }}>
+                          <span>❯</span>
                         </div>
-                      ) : (
-                        filteredLogs.map((line, idx) => {
-                          const isHttp = line.startsWith('[HTTP ') || line.startsWith('[HTTP]');
-                          const isSystem = line.startsWith('[System]');
-                          const isErr = !isHttp && !isSystem && (/error|exception|fail|crash|fatal/i.test(line));
-                          const isWarn = !isHttp && !isSystem && (/warn|warning/i.test(line));
-
-                          let color = '#9ba3af';
-                          if (isSystem) color = '#38bdf8';
-                          else if (isErr) color = '#f87171';
-                          else if (isWarn) color = '#fbbf24';
-                          else if (isHttp) {
-                            if (/-> 5\d\d/.test(line)) color = '#ef4444';
-                            else if (/-> 4\d\d/.test(line)) color = '#fbbf24';
-                            else if (/-> 2\d\d|-> 3\d\d/.test(line)) color = '#22c55e';
-                            else color = '#a78bfa';
-                          }
-
-                          return (
-                            <div key={idx} style={{ color, display: 'flex', gap: '8px', alignItems: 'baseline' }}>
-                              <span style={{ color: '#374151', fontSize: '10px', userSelect: 'none', minWidth: '28px', textAlign: 'right' }}>
-                                {idx + 1}
-                              </span>
-                              <span style={{ flex: 1, wordBreak: 'break-word' }}>
-                                {line}
-                              </span>
-                            </div>
-                          );
-                        })
-                      )}
+                        <input
+                          type="text"
+                          value={consoleInput}
+                          onChange={(e) => setConsoleInput(e.target.value)}
+                          placeholder="Type command or slash shortcut (/help, /restart, /status, /clear, ls -la, env)..."
+                          disabled={consoleRunning}
+                          style={{
+                            flex: 1,
+                            backgroundColor: 'transparent',
+                            border: 'none',
+                            color: '#e2e8f0',
+                            fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+                            fontSize: '12px',
+                            outline: 'none',
+                          }}
+                        />
+                        {/* Quick Command Shortcut Buttons */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '5px', flexShrink: 0 }}>
+                          {[
+                            { label: '/help', cmd: '/help' },
+                            { label: '/status', cmd: '/status' },
+                            { label: '/restart', cmd: '/restart' },
+                            { label: '/clear', cmd: '/clear' },
+                          ].map((shortcut) => (
+                            <button
+                              key={shortcut.label}
+                              type="button"
+                              onClick={() => void executeUnifiedCommand(shortcut.cmd, 'logs')}
+                              disabled={consoleRunning}
+                              style={{
+                                padding: '2px 8px',
+                                borderRadius: '4px',
+                                backgroundColor: 'rgba(255,255,255,0.04)',
+                                border: '1px solid rgba(255,255,255,0.08)',
+                                color: '#94a3b8',
+                                fontSize: '10px',
+                                fontFamily: 'monospace',
+                                cursor: 'pointer',
+                                transition: 'all 0.12s',
+                              }}
+                              className="hover:bg-violet-600/20 hover:text-violet-300 hover:border-violet-500/40"
+                            >
+                              {shortcut.label}
+                            </button>
+                          ))}
+                          <button
+                            type="submit"
+                            disabled={!consoleInput.trim() || consoleRunning}
+                            style={{
+                              padding: '4px 10px',
+                              borderRadius: '6px',
+                              backgroundColor: consoleInput.trim() && !consoleRunning ? '#7c3aed' : 'rgba(255,255,255,0.05)',
+                              border: 'none',
+                              color: consoleInput.trim() && !consoleRunning ? '#fff' : '#4b5563',
+                              fontSize: '11px',
+                              fontWeight: 600,
+                              cursor: consoleInput.trim() && !consoleRunning ? 'pointer' : 'default',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              transition: 'all 0.12s',
+                            }}
+                          >
+                            Run ↵
+                          </button>
+                        </div>
+                      </form>
                     </div>
                   </div>
                 );
@@ -2031,15 +2232,40 @@ export default function ProjectsTab() {
                   </div>
                   <div style={{ backgroundColor: '#08090c', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '10px', overflow: 'hidden', display: 'flex', flexDirection: 'column', height: '380px' }}>
                     {/* Terminal header bar */}
-                    <div style={{ height: '32px', backgroundColor: '#0e1015', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', padding: '0 12px', gap: '6px' }}>
-                      <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#ef4444' }} />
-                      <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#f59e0b' }} />
-                      <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#22c55e' }} />
-                      <span style={{ fontSize: '11px', color: '#4b5563', marginLeft: '8px', fontFamily: 'monospace' }}>container shell</span>
+                    <div style={{ height: '32px', backgroundColor: '#0e1015', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#ef4444' }} />
+                        <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#f59e0b' }} />
+                        <div style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: '#22c55e' }} />
+                        <span style={{ fontSize: '11px', color: '#4b5563', marginLeft: '8px', fontFamily: 'monospace' }}>container shell</span>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                        {['/help', '/status', '/restart', '/clear'].map((shortcut) => (
+                          <button
+                            key={shortcut}
+                            type="button"
+                            onClick={() => void executeUnifiedCommand(shortcut, 'terminal')}
+                            disabled={terminalRunning}
+                            style={{
+                              padding: '1px 6px',
+                              borderRadius: '4px',
+                              backgroundColor: 'rgba(255,255,255,0.04)',
+                              border: '1px solid rgba(255,255,255,0.08)',
+                              color: '#94a3b8',
+                              fontSize: '10px',
+                              fontFamily: 'monospace',
+                              cursor: 'pointer',
+                            }}
+                            className="hover:bg-violet-600/20 hover:text-violet-300"
+                          >
+                            {shortcut}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                    <div style={{ flex: 1, padding: '12px 16px', overflowY: 'auto', fontFamily: '"JetBrains Mono", "Fira Code", monospace', fontSize: '12px', lineHeight: 1.7 }}>
+                    <div ref={terminalScrollRef} style={{ flex: 1, padding: '12px 16px', overflowY: 'auto', fontFamily: '"JetBrains Mono", "Fira Code", monospace', fontSize: '12px', lineHeight: 1.7 }}>
                       {terminalHistory.map((line, idx) => (
-                        <div key={idx} style={{ color: line.startsWith('$') ? '#c4b5fd' : line.startsWith('Error') || line.startsWith('error') ? '#f87171' : '#9ba3af', fontWeight: line.startsWith('$') ? 700 : 400, whiteSpace: 'pre-wrap' }}>
+                        <div key={idx} style={{ color: line.startsWith('$') ? '#c4b5fd' : line.startsWith('Error') || line.startsWith('error') ? '#f87171' : line.startsWith('[System]') ? '#38bdf8' : '#9ba3af', fontWeight: line.startsWith('$') ? 700 : 400, whiteSpace: 'pre-wrap' }}>
                           {line}
                         </div>
                       ))}
@@ -2047,7 +2273,7 @@ export default function ProjectsTab() {
                     </div>
                     <form onSubmit={handleTerminalSubmit} style={{ display: 'flex', alignItems: 'center', borderTop: '1px solid rgba(255,255,255,0.06)', padding: '8px 14px', backgroundColor: '#0a0b0e', gap: '8px' }}>
                       <span style={{ color: '#22c55e', fontFamily: 'monospace', fontSize: '13px', fontWeight: 700, userSelect: 'none' }}>❯</span>
-                      <input type="text" value={terminalInput} onChange={e => setTerminalInput(e.target.value)} placeholder="Type command and press Enter..." disabled={terminalRunning}
+                      <input type="text" value={terminalInput} onChange={e => setTerminalInput(e.target.value)} placeholder="Type shell command or /help, /status, /restart, /clear..." disabled={terminalRunning}
                         style={{ flex: 1, backgroundColor: 'transparent', border: 'none', outline: 'none', color: '#e2e8f0', fontFamily: '"JetBrains Mono", "Fira Code", monospace', fontSize: '12px' }} />
                     </form>
                   </div>
