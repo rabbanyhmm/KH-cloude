@@ -2148,6 +2148,9 @@ export class ProjectsService implements OnModuleInit {
     startDeployment();
   }
 
+  /**
+   * Fetch the latest container runtime stdout/stderr logs for a project.
+   */
   async getRuntimeLogs(projectId: string, teamId: string) {
     const project = await this.prisma.project.findFirst({
       where: { id: projectId, teamId },
@@ -2179,6 +2182,9 @@ export class ProjectsService implements OnModuleInit {
     };
   }
 
+  /**
+   * Stream live container stdout/stderr logs over SSE for a project.
+   */
   streamRuntimeLogs(projectId: string, teamId: string): Observable<{ data: { chunk: string; type?: string } }> {
     return new Observable((subscriber) => {
       let proc: any;
@@ -2377,6 +2383,8 @@ export class ProjectsService implements OnModuleInit {
         const net = require('net');
         const socket = net.connect('/var/run/docker.sock');
         let done = false;
+        let upgraded = false;
+        let headerBuf = Buffer.alloc(0);
 
         const finish = (result: boolean) => {
           if (!done) {
@@ -2386,14 +2394,34 @@ export class ProjectsService implements OnModuleInit {
           }
         };
 
-        socket.setTimeout(600, () => finish(false));
+        socket.setTimeout(1500, () => finish(false));
         socket.on('error', () => finish(false));
 
-        socket.on('connect', () => {
-          const req = `POST /containers/${containerName}/attach?stdin=1&stream=1 HTTP/1.1\r\nHost: docker\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n${input}\n`;
-          socket.write(req, () => {
+        socket.on('data', (chunk: Buffer) => {
+          if (done || upgraded) return;
+          headerBuf = Buffer.concat([headerBuf, chunk]);
+          const headerEnd = headerBuf.indexOf('\r\n\r\n');
+          if (headerEnd === -1) {
+            // Guard against malformed oversized headers
+            if (headerBuf.length > 8192) finish(false);
+            return;
+          }
+
+          const statusLine = headerBuf.subarray(0, headerEnd).toString('utf8').split('\r\n')[0] || '';
+          if (!/^HTTP\/\d\.\d\s+101\b/i.test(statusLine)) {
+            finish(false);
+            return;
+          }
+
+          upgraded = true;
+          socket.write(`${input}\n`, () => {
             setTimeout(() => finish(true), 100);
           });
+        });
+
+        socket.on('connect', () => {
+          const req = `POST /containers/${encodeURIComponent(containerName)}/attach?stdin=1&stream=1 HTTP/1.1\r\nHost: docker\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n`;
+          socket.write(req);
         });
       } catch {
         resolve(false);
@@ -2467,12 +2495,15 @@ export class ProjectsService implements OnModuleInit {
       };
     }
 
-    // Execute command in container shell context (sh with bash fallback)
+    /**
+     * Execute a one-shot shell command inside the running container and close stdin immediately.
+     */
     const runExec = (cmd: string, shell: 'sh' | 'bash' = 'sh'): Promise<{ code: number | null; stdout: string; stderr: string }> => {
       return new Promise((resolve) => {
         const proc = spawn('docker', ['exec', '-i', containerName, shell, '-c', cmd], {
           timeout: 25000,
         });
+        proc.stdin?.end();
 
         let stdout = '';
         let stderr = '';

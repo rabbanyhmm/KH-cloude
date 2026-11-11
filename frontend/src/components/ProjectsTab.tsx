@@ -148,9 +148,11 @@ export default function ProjectsTab() {
   const [consoleInput, setConsoleInput] = useState('');
   const [consoleRunning, setConsoleRunning] = useState(false);
   const [autoScroll, setAutoScroll] = useState<boolean>(true);
-  const [commandHistory, setCommandHistory] = useState<string[]>([]);
+  const [commandHistoryByProject, setCommandHistoryByProject] = useState<Record<string, string[]>>({});
   const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  const commandHistory = activeProjectId ? (commandHistoryByProject[activeProjectId] || []) : [];
   const logScrollRef = useRef<HTMLDivElement>(null);
+  const lastContainerTailRef = useRef<string[]>([]);
   const terminalScrollRef = useRef<HTMLDivElement>(null);
 
   const [terminalInput, setTerminalInput] = useState('');
@@ -617,6 +619,40 @@ export default function ProjectsTab() {
     return () => clearInterval(interval);
   }, [activeProjectId, detailsTab]);
 
+  const isErrorConsoleLine = (line: string) =>
+    !line.startsWith('[System]') && /error|exception|fail|crash|fatal/i.test(line);
+
+  const isWarningConsoleLine = (line: string) =>
+    !line.startsWith('[System]') && /warn|warning/i.test(line);
+
+  const isErrorOrWarningLine = (line: string) =>
+    isErrorConsoleLine(line) || isWarningConsoleLine(line);
+
+  /**
+   * Compute suffix-to-prefix overlap length between a tracked container log tail and a refreshed snapshot.
+   */
+  const computeSnapshotOverlap = (prevTail: string[], nextLines: string[]): number => {
+    const maxOverlap = Math.min(prevTail.length, nextLines.length);
+    for (let k = maxOverlap; k >= 1; k--) {
+      const offset = prevTail.length - k;
+      let matches = true;
+      for (let i = 0; i < k; i++) {
+        if (prevTail[offset + i] !== nextLines[i]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return k;
+    }
+    return 0;
+  };
+
+  useEffect(() => {
+    setHistoryIndex(-1);
+    setConsoleInput('');
+    lastContainerTailRef.current = [];
+  }, [activeProjectId]);
+
   const fetchRuntimeLogs = async (silent = false) => {
     if (!activeProjectId || !activeTeam?.id) return;
     if (!silent) setLogsLoading(true);
@@ -625,21 +661,23 @@ export default function ProjectsTab() {
       if (data?.logs) {
         const rawLines = (data.logs || '')
           .split('\n')
-          .filter((l: string) => l.trim() !== '')
-          .filter((l: string) => !l.startsWith('[HTTP ') && !l.startsWith('[HTTP]'));
+          .filter((l: string) => l.trim() !== '');
 
         setRuntimeLogs((prev) => {
           if (!silent || prev.length <= 1) {
-            return rawLines.slice(-300);
+            const initial = rawLines.slice(-300);
+            lastContainerTailRef.current = initial;
+            return initial;
           }
-          // Merge: preserve locally executed commands and outputs while appending any new container lines
-          const existingSet = new Set(prev);
-          const newLines = rawLines.filter((l: string) => !existingSet.has(l));
+          const overlap = computeSnapshotOverlap(lastContainerTailRef.current, rawLines);
+          const newLines = rawLines.slice(overlap);
           if (newLines.length === 0) return prev;
+          lastContainerTailRef.current = [...lastContainerTailRef.current, ...newLines].slice(-500);
           const merged = [...prev, ...newLines];
           return merged.length > 500 ? merged.slice(merged.length - 500) : merged;
         });
       } else if (!silent) {
+        lastContainerTailRef.current = [];
         setRuntimeLogs(['[System] No container output recorded yet.']);
       }
     } catch (err: any) {
@@ -656,6 +694,7 @@ export default function ProjectsTab() {
     if (!activeProjectId || !activeTeam?.id || detailsTab !== 'console') return;
     
     let isSubscribed = true;
+    let streamOpen = false;
     let eventSource: EventSource | null = null;
     let fallbackPollTimer: any = null;
 
@@ -679,6 +718,7 @@ export default function ProjectsTab() {
 
       eventSource.onopen = () => {
         if (!isSubscribed) return;
+        streamOpen = true;
         setIsLogStreaming(true);
       };
 
@@ -690,9 +730,9 @@ export default function ProjectsTab() {
           if (data.chunk && data.chunk.trim() !== '') {
             const lines = data.chunk
               .split('\n')
-              .filter((l: string) => l.trim() !== '')
-              .filter((l: string) => !l.startsWith('[HTTP ') && !l.startsWith('[HTTP]'));
+              .filter((l: string) => l.trim() !== '');
             if (lines.length > 0) {
+              lastContainerTailRef.current = [...lastContainerTailRef.current, ...lines].slice(-500);
               setRuntimeLogs((prev) => {
                 const newLogs = [...prev, ...lines];
                 return newLogs.length > 500 ? newLogs.slice(newLogs.length - 500) : newLogs;
@@ -701,35 +741,37 @@ export default function ProjectsTab() {
           }
         } catch {
           if (event.data && typeof event.data === 'string' && event.data.trim()) {
-            if (!event.data.startsWith('[HTTP ') && !event.data.startsWith('[HTTP]')) {
-              setRuntimeLogs((prev) => [...prev, event.data].slice(-500));
-            }
+            lastContainerTailRef.current = [...lastContainerTailRef.current, event.data].slice(-500);
+            setRuntimeLogs((prev) => [...prev, event.data].slice(-500));
           }
         }
       };
 
       eventSource.onerror = () => {
         if (!isSubscribed) return;
+        streamOpen = false;
         setIsLogStreaming(false);
       };
     } catch {
+      streamOpen = false;
       setIsLogStreaming(false);
     }
 
     // 3. Fallback poll every 8 seconds only if live SSE stream is not active
     fallbackPollTimer = setInterval(() => {
-      if (isSubscribed && !isLogStreaming) {
+      if (isSubscribed && !streamOpen) {
         fetchRuntimeLogs(true);
       }
     }, 8000);
 
     return () => {
       isSubscribed = false;
+      streamOpen = false;
       setIsLogStreaming(false);
       if (eventSource) eventSource.close();
       if (fallbackPollTimer) clearInterval(fallbackPollTimer);
     };
-  }, [activeProjectId, activeTeam?.id, detailsTab, accessToken, isLogStreaming]);
+  }, [activeProjectId, activeTeam?.id, detailsTab, accessToken]);
 
   // Smart auto-scroll: auto-scroll to bottom only when user is at the bottom (Pterodactyl behavior)
   useEffect(() => {
@@ -853,13 +895,13 @@ export default function ProjectsTab() {
     } finally {
       if (target === 'logs') setConsoleRunning(false);
       else setTerminalRunning(false);
-      setTimeout(() => {
-        if (target === 'logs' && logScrollRef.current) {
-          logScrollRef.current.scrollTop = logScrollRef.current.scrollHeight;
-        } else if (terminalScrollRef.current) {
-          terminalScrollRef.current.scrollTop = terminalScrollRef.current.scrollHeight;
-        }
-      }, 50);
+      if (target !== 'logs') {
+        setTimeout(() => {
+          if (terminalScrollRef.current) {
+            terminalScrollRef.current.scrollTop = terminalScrollRef.current.scrollHeight;
+          }
+        }, 50);
+      }
     }
   };
 
@@ -897,7 +939,11 @@ export default function ProjectsTab() {
     const cmd = consoleInput.trim();
     setConsoleInput('');
     setHistoryIndex(-1);
-    setCommandHistory((prev) => (prev[prev.length - 1] === cmd ? prev : [...prev, cmd].slice(-50)));
+    setCommandHistoryByProject((prev) => {
+      const projectHist = prev[activeProjectId] || [];
+      if (projectHist[projectHist.length - 1] === cmd) return prev;
+      return { ...prev, [activeProjectId]: [...projectHist, cmd].slice(-50) };
+    });
     void executeUnifiedCommand(cmd, 'logs');
   };
 
@@ -2035,17 +2081,15 @@ export default function ProjectsTab() {
 
               {/* ── Runtime Console (Pterodactyl Simulation) ── */}
               {detailsTab === 'console' && (() => {
+                const searchTerm = logSearch.trim().toLowerCase();
                 const filteredLogs = runtimeLogs.filter(line => {
-                  if (line.startsWith('[HTTP ') || line.startsWith('[HTTP]')) return false;
-                  if (logFilter === 'errors') {
-                    return /error|exception|fail|crash|fatal/i.test(line);
-                  }
-                  if (logSearch.trim() && !line.toLowerCase().includes(logSearch.toLowerCase().trim())) return false;
+                  if (logFilter === 'errors' && !isErrorOrWarningLine(line)) return false;
+                  if (searchTerm && !line.toLowerCase().includes(searchTerm)) return false;
                   return true;
                 });
 
-                const cleanAppLogs = runtimeLogs.filter(l => !l.startsWith('[HTTP ') && !l.startsWith('[HTTP]'));
-                const errorCount = cleanAppLogs.filter(l => /error|exception|fail|crash|fatal/i.test(l)).length;
+                const cleanAppLogs = runtimeLogs;
+                const errorCount = cleanAppLogs.filter(isErrorOrWarningLine).length;
 
                 return (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
@@ -2162,8 +2206,8 @@ export default function ProjectsTab() {
                             const line = rawLine.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
                             const isSystem = line.startsWith('[System]');
                             const isExec = line.startsWith('[Exec]') || line.startsWith('>') || line.startsWith('$');
-                            const isErr = !isSystem && (/error|exception|fail|crash|fatal/i.test(line));
-                            const isWarn = !isSystem && (/warn|warning/i.test(line));
+                            const isErr = isErrorConsoleLine(line);
+                            const isWarn = isWarningConsoleLine(line);
 
                             let color = '#e2e8f0';
                             if (isExec) color = '#c4b5fd';
