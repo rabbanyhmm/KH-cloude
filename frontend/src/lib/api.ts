@@ -52,6 +52,29 @@ export const getApiBase = (): string => {
 
 export const API_BASE = getApiBase();
 
+/**
+ * Validate a cross-subdomain redirect URL so an attacker-supplied `?redirect=`
+ * can never exfiltrate `session_data` (JWT/session payload) to an external origin.
+ */
+export function getSafeRedirectUrl(candidate?: string | null, fallback?: string): string {
+  const defaultDest = fallback || getDomainUrl('cloud');
+  if (!candidate) return defaultDest;
+  try {
+    const parsed = new URL(candidate, typeof window !== 'undefined' ? window.location.origin : defaultDest);
+    const host = parsed.hostname.toLowerCase();
+    const base = getBaseDomain().toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1') {
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : defaultDest;
+    }
+    if (parsed.protocol === 'https:' && (host === base || host.endsWith(`.${base}`))) {
+      return parsed.toString();
+    }
+  } catch {
+    // Invalid URL format
+  }
+  return defaultDest;
+}
+
 export async function apiRequest(path: string, options: RequestInit = {}) {
   // Normalize path to prevent accidental '/api/api/...' double prefixing
   let cleanPath = path;

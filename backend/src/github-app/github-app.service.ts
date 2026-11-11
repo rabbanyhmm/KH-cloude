@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
+import { getJwtSecret } from '../auth/token.service';
 
 @Injectable()
 export class GithubAppService {
@@ -315,7 +316,7 @@ export class GithubAppService {
 
   getInstallUrl(teamId: string, userId?: string): string {
     const appSlug = process.env.GITHUB_APP_SLUG || 'kh-cloud-app';
-    const secret = process.env.JWT_SECRET || 'fallback_secret_for_hmac';
+    const secret = getJwtSecret();
     const payload = JSON.stringify({
       teamId,
       userId: userId || null,

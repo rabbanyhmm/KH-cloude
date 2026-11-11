@@ -1,5 +1,23 @@
 import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { SignJWT, jwtVerify } from 'jose';
+import * as crypto from 'crypto';
+
+let cachedRuntimeSecret: string | null = null;
+
+/**
+ * Resolve the platform signing secret once per process, falling back to an
+ * ephemeral cryptographically-random secret rather than any hardcoded string.
+ */
+export function getJwtSecret(): string {
+  const envSecret = process.env.JWT_SECRET ?? '';
+  if (envSecret && envSecret.length >= 32) {
+    return envSecret;
+  }
+  if (!cachedRuntimeSecret) {
+    cachedRuntimeSecret = crypto.randomBytes(32).toString('hex');
+  }
+  return cachedRuntimeSecret;
+}
 
 export interface TokenPayload {
   sub: string;
@@ -12,16 +30,14 @@ export class TokenService implements OnModuleInit {
   private secret!: Uint8Array;
 
   onModuleInit() {
-    let raw = process.env.JWT_SECRET ?? '';
-    if (!raw || raw.length < 32) {
+    const envRaw = process.env.JWT_SECRET ?? '';
+    if (!envRaw || envRaw.length < 32) {
       this.logger.warn(
         '⚠️ WARNING: JWT_SECRET is missing or too short. Generating an ephemeral random secret for this session. ' +
           'All users will be logged out when the server restarts. Please set a strong 32+ char JWT_SECRET in .env.',
       );
-      // Generate a random 32-byte hex string
-      raw = require('crypto').randomBytes(32).toString('hex');
     }
-    this.secret = new TextEncoder().encode(raw);
+    this.secret = new TextEncoder().encode(getJwtSecret());
     this.logger.log('TokenService initialized — JWT_SECRET loaded.');
   }
 

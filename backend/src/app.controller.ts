@@ -16,7 +16,7 @@ import { TeamRole, DatabaseType } from '@prisma/client';
 import { sendDirectDiscordNotification } from './utils/discord-webhook';
 import { RbacService } from './guards/rbac.service';
 import { PlanLimitsService } from './billing/plan-limits.service';
-import { TokenService } from './auth/token.service';
+import { TokenService, getJwtSecret } from './auth/token.service';
 import { Public } from './auth/public.decorator';
 import { UserDto } from './auth/dto/user.dto';
 
@@ -296,24 +296,32 @@ export class AppController {
   }
 
   @Get('user/invites')
-  async getUserInvites(@Query('email') email: string) {
-    return this.teams.getUserPendingInvites(email);
+  async getUserInvites(@Query('email') email: string, @Req() req: express.Request) {
+    const userId = (req as any).user.id as string;
+    const authUser = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!authUser) throw new NotFoundException('User not found.');
+    if (email && email.toLowerCase() !== authUser.email.toLowerCase()) {
+      throw new ForbiddenException('You may only view invites for your own account.');
+    }
+    return this.teams.getUserPendingInvites(authUser.email);
   }
 
   @Post('teams/invites/:inviteId/accept')
   async acceptInvite(
     @Param('inviteId') inviteId: string,
-    @Body() body: { userId: string }
+    @Req() req: express.Request,
   ) {
-    return this.teams.acceptInvite(inviteId, body.userId);
+    const userId = (req as any).user.id as string;
+    return this.teams.acceptInvite(inviteId, userId);
   }
 
   @Post('teams/invites/:inviteId/reject')
   async rejectInvite(
     @Param('inviteId') inviteId: string,
-    @Body() body: { userId: string }
+    @Req() req: express.Request,
   ) {
-    return this.teams.rejectInvite(inviteId, body.userId);
+    const userId = (req as any).user.id as string;
+    return this.teams.rejectInvite(inviteId, userId);
   }
 
   @Delete('teams/:teamId/invites/:inviteId')
@@ -522,13 +530,10 @@ export class AppController {
   @Get('projects/:id/network')
   async getProjectNetwork(
     @Param('id') id: string,
-    @Query('userId') queryUserId: string,
     @Req() req: express.Request,
   ) {
-    const userId = (req as any).user?.id || queryUserId;
-    if (userId) {
-      await this.rbac.verifyProjectAccess(userId, id, 'VIEWER');
-    }
+    const userId = (req as any).user.id as string;
+    await this.rbac.verifyProjectAccess(userId, id, 'VIEWER');
     return this.networkService.getStats(id);
   }
 
@@ -589,10 +594,10 @@ export class AppController {
     @Headers('x-hub-signature-256') signature: string,
     @Req() req: any,
   ) {
-    // Verify HMAC signature using GitHub App webhook secret
+    // Verify HMAC signature using GitHub App webhook secret (mandatory)
     const rawBody = req.rawBody || JSON.stringify(payload);
-    if (signature && !this.githubApp.verifyWebhookSignature(rawBody, signature)) {
-      throw new BadRequestException('Invalid webhook signature.');
+    if (!signature || !this.githubApp.verifyWebhookSignature(rawBody, signature)) {
+      throw new UnauthorizedException('Invalid or missing webhook signature.');
     }
 
     if (event === 'installation') {
@@ -1024,8 +1029,11 @@ export class AppController {
       } catch {}
     }
 
-    const clientId = process.env.GITHUB_CLIENT_ID || 'Iv23libP2nC0sNq21c8u'; // Default/fallback Client ID
-    const clientSecret = process.env.GITHUB_CLIENT_SECRET || 'a1b2c3d4e5f6g7h8i9j0'; // Default/fallback Secret
+    const clientId = process.env.GITHUB_CLIENT_ID || '';
+    const clientSecret = process.env.GITHUB_CLIENT_SECRET || '';
+    if (!clientId || !clientSecret) {
+      throw new BadRequestException('GitHub OAuth credentials not configured on the backend.');
+    }
 
     // 1. Exchange code for access token
     const tokenUrl = 'https://github.com/login/oauth/access_token';
@@ -1138,7 +1146,7 @@ export class AppController {
       this.tokens.signRefreshToken(user.id),
     ]);
     this.setSessionCookies(res, accessToken, refreshToken);
-    return { user, teams, accessToken };
+    return { user: UserDto.from(user), teams, accessToken };
   }
 
   @Public()
@@ -1243,7 +1251,7 @@ export class AppController {
       this.tokens.signRefreshToken(user.id),
     ]);
     this.setSessionCookies(res, accessToken, refreshToken);
-    return { user, teams, accessToken };
+    return { user: UserDto.from(user), teams, accessToken };
   }
   // --- GITHUB APP ENDPOINTS ---
 
@@ -1255,57 +1263,38 @@ export class AppController {
 
     if (teamInstalls.length === 0) {
       try {
-        const allGithubInstalls = await this.githubApp.listAllInstallations();
-        if (allGithubInstalls.length > 0) {
-          const user = await this.prisma.user.findUnique({ where: { id: userId } });
-          const userGithubLogin = user?.email?.endsWith('@github.com')
-            ? user.email.replace('@github.com', '').toLowerCase()
-            : (user?.name || '').toLowerCase().replace(/\s+/g, '');
-
-          const userEmailPrefix = user?.email ? user.email.split('@')[0].toLowerCase() : '';
-
-          const teamProjects = await this.prisma.project.findMany({
-            where: { teamId },
-            select: { githubRepo: true },
-          });
-          const repoOwners = new Set(
-            teamProjects
-              .filter((p) => p.githubRepo && p.githubRepo.includes('/'))
-              .map((p) => p.githubRepo!.split('/')[0].toLowerCase()),
-          );
-
-          for (const gInst of allGithubInstalls) {
-            const loginLower = gInst.accountLogin.toLowerCase();
-            const matches =
-              loginLower === userGithubLogin ||
-              loginLower === userEmailPrefix ||
-              repoOwners.has(loginLower);
-
-            if (matches) {
-              await (this.prisma.githubInstallation as any).upsert({
-                where: { teamId_installationId: { teamId, installationId: gInst.installationId } },
-                create: {
-                  installationId: gInst.installationId,
-                  teamId,
-                  accountLogin: gInst.accountLogin,
-                  accountType: gInst.accountType,
-                  avatarUrl: gInst.avatarUrl,
-                },
-                update: {
-                  accountLogin: gInst.accountLogin,
-                  accountType: gInst.accountType,
-                  avatarUrl: gInst.avatarUrl,
-                },
-              });
-              this.logger.log(`Auto-reconciled GitHub installation ${gInst.installationId} (@${gInst.accountLogin}) for team ${teamId}.`);
-            }
-          }
-
-          teamInstalls = await (this.prisma.githubInstallation as any).findMany({
-            where: { teamId },
-            orderBy: { createdAt: 'asc' },
-          });
+        const user = await this.prisma.user.findUnique({ where: { id: userId } });
+        const verifiedGithubLogin = user?.githubUsername?.toLowerCase();
+        if (!verifiedGithubLogin) {
+          return teamInstalls;
         }
+
+        const allGithubInstalls = await this.githubApp.listAllInstallations();
+        for (const gInst of allGithubInstalls) {
+          if (gInst.accountLogin.toLowerCase() === verifiedGithubLogin) {
+            await (this.prisma.githubInstallation as any).upsert({
+              where: { teamId_installationId: { teamId, installationId: gInst.installationId } },
+              create: {
+                installationId: gInst.installationId,
+                teamId,
+                accountLogin: gInst.accountLogin,
+                accountType: gInst.accountType,
+                avatarUrl: gInst.avatarUrl,
+              },
+              update: {
+                accountLogin: gInst.accountLogin,
+                accountType: gInst.accountType,
+                avatarUrl: gInst.avatarUrl,
+              },
+            });
+            this.logger.log(`Auto-reconciled GitHub installation ${gInst.installationId} (@${gInst.accountLogin}) for team ${teamId}.`);
+          }
+        }
+
+        teamInstalls = await (this.prisma.githubInstallation as any).findMany({
+          where: { teamId },
+          orderBy: { createdAt: 'asc' },
+        });
       } catch (err: any) {
         this.logger.warn(`GitHub installation auto-reconciliation warning: ${err.message}`);
       }
@@ -1393,33 +1382,37 @@ export class AppController {
       throw new BadRequestException('installation_id is required.');
     }
 
-    let teamId: string | null = queryTeamId || null;
+    let teamId: string | null = null;
     let verifiedUserId: string | null = null;
     let exp: number | null = null;
+    let stateVerified = false;
 
     if (state) {
       try {
         const decodedStr = Buffer.from(state, 'base64url').toString('utf-8');
-        let parsed: any = null;
-        try { parsed = JSON.parse(decodedStr); } catch {}
-
+        const parsed = JSON.parse(decodedStr);
         if (parsed?.payload && parsed?.hmac) {
-          const secret = process.env.JWT_SECRET || 'fallback_secret_for_hmac';
-          const expectedHmac = require('crypto').createHmac('sha256', secret).update(parsed.payload).digest('hex');
-          if (parsed.hmac === expectedHmac) {
+          const crypto = require('crypto');
+          const expectedHmac = crypto.createHmac('sha256', getJwtSecret()).update(parsed.payload).digest('hex');
+          const a = Buffer.from(String(parsed.hmac), 'utf8');
+          const b = Buffer.from(expectedHmac, 'utf8');
+          if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
             const decodedPayload = JSON.parse(parsed.payload);
-            teamId = decodedPayload.teamId || teamId;
+            teamId = decodedPayload.teamId || null;
             verifiedUserId = decodedPayload.userId || null;
             exp = decodedPayload.exp || null;
-          } else {
-            this.logger.warn('HMAC signature mismatch on state; falling back to token/team inspection.');
+            stateVerified = true;
           }
-        } else if (parsed?.teamId) {
-          teamId = parsed.teamId;
         }
       } catch (err) {
-        this.logger.warn(`Could not parse state parameter: ${err}`);
+        this.logger.warn(`Invalid GitHub App state parameter: ${err}`);
       }
+    }
+
+    if (state && !stateVerified) {
+      const msg = 'Invalid GitHub App installation state signature.';
+      if (isHtml) return renderHtmlResponse(false, msg);
+      throw new BadRequestException(msg);
     }
 
     if (exp && Date.now() > exp) {
@@ -1442,7 +1435,11 @@ export class AppController {
       }
     }
 
-    // If teamId is still missing, attempt to find user's primary team if user is known
+    if (!teamId && queryTeamId && verifiedUserId) {
+      teamId = queryTeamId;
+    }
+
+    // If teamId is still missing, attempt to find user's primary team if user is authenticated
     if (!teamId && verifiedUserId) {
       const userTeam = await this.prisma.teamMember.findFirst({
         where: { userId: verifiedUserId },
@@ -1455,7 +1452,7 @@ export class AppController {
     let installJson: any = null;
     try {
       const jwt = this.githubApp.generateAppJwt();
-      const installRes = await fetch(`https://api.github.com/app/installations/${installationId}`, {
+      const installRes = await fetch(`https://api.github.com/app/installations/${encodeURIComponent(installationId)}`, {
         headers: {
           Authorization: `Bearer ${jwt}`,
           Accept: 'application/vnd.github+json',
@@ -1474,40 +1471,13 @@ export class AppController {
     const accountType: string = installJson?.account?.type || 'User';
     const avatarUrl: string | null = installJson?.account?.avatar_url || null;
 
-    if (!teamId && accountLogin !== 'unknown') {
-      // Find a user or project matching this GitHub account
-      const matchedUser = await this.prisma.user.findFirst({
-        where: {
-          OR: [
-            { githubUsername: accountLogin },
-            { email: `${accountLogin}@github.com` },
-            { email: { startsWith: `${accountLogin}@` } },
-            { name: accountLogin },
-          ],
-        },
-        include: { teamMembers: true },
-      });
-      if (matchedUser && matchedUser.teamMembers?.length > 0) {
-        teamId = matchedUser.teamMembers[0].teamId;
-        verifiedUserId = matchedUser.id;
-      } else {
-        // Look up by project githubRepo
-        const matchedProject = await this.prisma.project.findFirst({
-          where: { githubRepo: { startsWith: `${accountLogin}/` } },
-        });
-        if (matchedProject) {
-          teamId = matchedProject.teamId;
-        }
-      }
-    }
-
-    if (!teamId) {
-      const msg = 'Could not determine the KH Cloud Team for this installation. Please open KH Cloud and click Connect GitHub.';
+    if (!verifiedUserId || !teamId) {
+      const msg = 'Authentication and valid team context are required to connect a GitHub App installation.';
       if (isHtml) return renderHtmlResponse(false, msg);
-      throw new BadRequestException(msg);
+      throw new UnauthorizedException(msg);
     }
 
-    // Verify team exists
+    // Verify team exists and authenticated user has DEVELOPER+ role on that team
     const team = await this.prisma.team.findUnique({ where: { id: teamId } });
     if (!team) {
       const msg = 'KH Cloud team not found.';
@@ -1515,14 +1485,7 @@ export class AppController {
       throw new BadRequestException(msg);
     }
 
-    // If verifiedUserId is available, verify team access
-    if (verifiedUserId) {
-      try {
-        await this.rbac.verifyTeamRole(verifiedUserId, teamId, 'DEVELOPER');
-      } catch (err: any) {
-        this.logger.warn(`User ${verifiedUserId} does not have required role on team ${teamId}: ${err.message}`);
-      }
-    }
+    await this.rbac.verifyTeamRole(verifiedUserId, teamId, 'DEVELOPER');
 
     // Upsert GithubInstallation for this team + installationId
     await (this.prisma.githubInstallation as any).upsert({
@@ -1960,12 +1923,14 @@ export class AppController {
   // --- GITHUB REPOS (LEGACY — OAuth access token, fallback only) ---
 
   @Get('github/repos')
-
-  async getGithubRepos(@Query('userId') userId: string) {
-    if (!userId) throw new BadRequestException('User ID is required.');
+  async getGithubRepos(@Query('userId') queryUserId: string, @Req() req: express.Request) {
+    const authUserId = (req as any).user.id as string;
+    if (queryUserId && queryUserId !== authUserId) {
+      throw new ForbiddenException('You may only list repositories for your own account.');
+    }
 
     const user = await this.prisma.user.findUnique({
-      where: { id: userId },
+      where: { id: authUserId },
     });
 
     if (!user || !user.githubAccessToken) {
@@ -1998,14 +1963,19 @@ export class AppController {
 
   @Get('github/repos/detect')
   async detectGithubProject(
-    @Query('userId') userId: string,
+    @Query('userId') queryUserId: string,
     @Query('repo') repo: string,
     @Query('branch') branch?: string,
-    @Query('rootDir') rootDir?: string
+    @Query('rootDir') rootDir?: string,
+    @Req() req?: express.Request,
   ) {
-    if (!userId || !repo) throw new BadRequestException('User ID and repo are required.');
+    const authUserId = (req as any)?.user?.id as string;
+    if (!repo) throw new BadRequestException('Repo is required.');
+    if (queryUserId && queryUserId !== authUserId) {
+      throw new ForbiddenException('You may only inspect repositories for your own account.');
+    }
 
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    const user = await this.prisma.user.findUnique({ where: { id: authUserId } });
     if (!user || !user.githubAccessToken) {
       throw new BadRequestException('GitHub access token not found for user.');
     }
@@ -2176,21 +2146,26 @@ export class AppController {
 
   // --- ADMIN PANEL ENDPOINTS ---
 
-  private async verifyAdmin(adminUserId: string) {
-    if (!adminUserId) {
-      throw new BadRequestException('Admin user ID is required.');
+  private async verifyAdmin(req: express.Request, adminUserId?: string): Promise<string> {
+    const authUserId = (req as any).user?.id as string | undefined;
+    if (!authUserId) {
+      throw new UnauthorizedException('Authentication required.');
+    }
+    if (adminUserId && adminUserId !== authUserId) {
+      throw new ForbiddenException('Access denied. Admin identity mismatch.');
     }
     const adminUser = await this.prisma.user.findUnique({
-      where: { id: adminUserId },
+      where: { id: authUserId },
     });
     if (!adminUser || adminUser.role !== 'ADMIN') {
-      throw new BadRequestException('Access denied. Admin privileges required.');
+      throw new ForbiddenException('Access denied. Admin privileges required.');
     }
+    return authUserId;
   }
 
   @Get('admin/users')
-  async adminGetUsers(@Query('adminUserId') adminUserId: string) {
-    await this.verifyAdmin(adminUserId);
+  async adminGetUsers(@Req() req: express.Request, @Query('adminUserId') adminUserId?: string) {
+    await this.verifyAdmin(req, adminUserId);
     const users = await this.prisma.user.findMany({
       include: {
         teamMembers: {
@@ -2244,9 +2219,10 @@ export class AppController {
   async adminToggleUserRole(
     @Param('id') userId: string,
     @Body('role') role: string,
-    @Query('adminUserId') adminUserId: string,
+    @Req() req: express.Request,
+    @Query('adminUserId') adminUserId?: string,
   ) {
-    await this.verifyAdmin(adminUserId);
+    await this.verifyAdmin(req, adminUserId);
     if (role !== 'USER' && role !== 'ADMIN') {
       throw new BadRequestException('Invalid role.');
     }
@@ -2261,10 +2237,11 @@ export class AppController {
   @Delete('admin/users/:id')
   async adminDeleteUser(
     @Param('id') userId: string,
-    @Query('adminUserId') adminUserId: string,
+    @Req() req: express.Request,
+    @Query('adminUserId') adminUserId?: string,
   ) {
-    await this.verifyAdmin(adminUserId);
-    if (userId === adminUserId) {
+    const verifiedAdminId = await this.verifyAdmin(req, adminUserId);
+    if (userId === verifiedAdminId) {
       throw new BadRequestException('You cannot delete your own admin account.');
     }
     await this.prisma.user.delete({ where: { id: userId } });
@@ -2272,8 +2249,8 @@ export class AppController {
   }
 
   @Get('admin/projects')
-  async adminGetProjects(@Query('adminUserId') adminUserId: string) {
-    await this.verifyAdmin(adminUserId);
+  async adminGetProjects(@Req() req: express.Request, @Query('adminUserId') adminUserId?: string) {
+    await this.verifyAdmin(req, adminUserId);
     const projects = await this.prisma.project.findMany({
       include: {
         team: true,
@@ -2286,9 +2263,10 @@ export class AppController {
   async adminToggleProjectStatus(
     @Param('id') projectId: string,
     @Body('status') status: any,
-    @Query('adminUserId') adminUserId: string,
+    @Req() req: express.Request,
+    @Query('adminUserId') adminUserId?: string,
   ) {
-    await this.verifyAdmin(adminUserId);
+    await this.verifyAdmin(req, adminUserId);
     
     const project = await this.prisma.project.update({
       where: { id: projectId },
@@ -2307,16 +2285,17 @@ export class AppController {
   @Delete('admin/projects/:id')
   async adminDeleteProject(
     @Param('id') projectId: string,
-    @Query('adminUserId') adminUserId: string,
+    @Req() req: express.Request,
+    @Query('adminUserId') adminUserId?: string,
   ) {
-    await this.verifyAdmin(adminUserId);
-    await this.projects.deleteProject(projectId, adminUserId);
+    const verifiedAdminId = await this.verifyAdmin(req, adminUserId);
+    await this.projects.deleteProject(projectId, verifiedAdminId);
     return { success: true };
   }
 
   @Get('admin/buckets')
-  async adminGetBuckets(@Query('adminUserId') adminUserId: string) {
-    await this.verifyAdmin(adminUserId);
+  async adminGetBuckets(@Req() req: express.Request, @Query('adminUserId') adminUserId?: string) {
+    await this.verifyAdmin(req, adminUserId);
     const buckets = await this.prisma.bucket.findMany({
       include: {
         team: true,
@@ -2334,9 +2313,10 @@ export class AppController {
   async adminUpdateBucketLimit(
     @Param('id') bucketId: string,
     @Body('sizeLimit') sizeLimit: string,
-    @Query('adminUserId') adminUserId: string,
+    @Req() req: express.Request,
+    @Query('adminUserId') adminUserId?: string,
   ) {
-    await this.verifyAdmin(adminUserId);
+    await this.verifyAdmin(req, adminUserId);
     const limitBytes = BigInt(sizeLimit);
     
     const bucket = await this.prisma.bucket.update({
@@ -2354,9 +2334,10 @@ export class AppController {
   @Delete('admin/buckets/:id')
   async adminDeleteBucket(
     @Param('id') bucketId: string,
-    @Query('adminUserId') adminUserId: string,
+    @Req() req: express.Request,
+    @Query('adminUserId') adminUserId?: string,
   ) {
-    await this.verifyAdmin(adminUserId);
+    await this.verifyAdmin(req, adminUserId);
     
     const bucket = await this.prisma.bucket.findUnique({ where: { id: bucketId } });
     if (!bucket) {
@@ -2370,8 +2351,8 @@ export class AppController {
   }
 
   @Get('admin/subscriptions')
-  async adminGetSubscriptions(@Query('adminUserId') adminUserId: string) {
-    await this.verifyAdmin(adminUserId);
+  async adminGetSubscriptions(@Req() req: express.Request, @Query('adminUserId') adminUserId?: string) {
+    await this.verifyAdmin(req, adminUserId);
     const subs = await this.prisma.billingSubscription.findMany({
       include: {
         team: true,
@@ -2383,9 +2364,10 @@ export class AppController {
   @Post('admin/subscriptions/override')
   async adminOverrideSubscription(
     @Body() body: { teamId: string; planId: string; status: string },
-    @Query('adminUserId') adminUserId: string,
+    @Req() req: express.Request,
+    @Query('adminUserId') adminUserId?: string,
   ) {
-    await this.verifyAdmin(adminUserId);
+    await this.verifyAdmin(req, adminUserId);
     const { teamId, planId, status } = body;
     if (!teamId || !planId || !status) {
       throw new BadRequestException('teamId, planId and status are required.');
@@ -2408,8 +2390,8 @@ export class AppController {
   }
 
   @Get('admin/system/storage')
-  async adminGetSystemStorage(@Query('adminUserId') adminUserId: string) {
-    await this.verifyAdmin(adminUserId);
+  async adminGetSystemStorage(@Req() req: express.Request, @Query('adminUserId') adminUserId?: string) {
+    await this.verifyAdmin(req, adminUserId);
 
     const fs = require('fs');
     const path = require('path');
@@ -2503,8 +2485,8 @@ export class AppController {
   }
 
   @Get('admin/system/storage-analyzer')
-  async adminGetSystemStorageAnalyzer(@Query('adminUserId') adminUserId: string) {
-    await this.verifyAdmin(adminUserId);
+  async adminGetSystemStorageAnalyzer(@Req() req: express.Request, @Query('adminUserId') adminUserId?: string) {
+    await this.verifyAdmin(req, adminUserId);
 
     const { execSync } = require('child_process');
     const path = require('path');
@@ -2567,10 +2549,11 @@ export class AppController {
 
   @Post('admin/system/prune')
   async adminPruneSystem(
-    @Query('adminUserId') adminUserId: string,
+    @Req() req: express.Request,
+    @Query('adminUserId') adminUserId?: string,
     @Query('mode') mode: string = 'standard',
   ) {
-    await this.verifyAdmin(adminUserId);
+    await this.verifyAdmin(req, adminUserId);
 
     const { execSync } = require('child_process');
 
@@ -2933,16 +2916,24 @@ export class AppController {
 
   @Post('admin/maintenance/prune')
   async triggerDockerPrune(
+    @Req() req: express.Request,
     @Headers('x-admin-key') adminKey?: string,
     @Query('adminKey') queryAdminKey?: string,
   ) {
     const key = adminKey || queryAdminKey;
     const expectedKey = process.env.ADMIN_API_KEY;
 
-    if (expectedKey && key !== expectedKey) {
-      throw new BadRequestException('Unauthorized. Invalid admin key.');
+    if (expectedKey && key) {
+      const crypto = require('crypto');
+      const a = Buffer.from(key, 'utf8');
+      const b = Buffer.from(expectedKey, 'utf8');
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+        return this.maintenance.runDockerPrune();
+      }
+      throw new UnauthorizedException('Unauthorized. Invalid admin key.');
     }
 
+    await this.verifyAdmin(req);
     return this.maintenance.runDockerPrune();
   }
 }
