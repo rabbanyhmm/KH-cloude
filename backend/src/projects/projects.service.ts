@@ -2171,31 +2171,10 @@ export class ProjectsService implements OnModuleInit {
     const logsRes = await runCmd(`docker logs --tail 200 ${containerName}`).catch(() => ({ stdout: '', stderr: 'Container not running or not found.' }));
     const containerLogs = (logsRes.stdout || '') + (logsRes.stderr ? '\n' + logsRes.stderr : '');
 
-    // Fetch recent website HTTP traffic logs from Traefik
-    let httpLogs: any[] = [];
-    try {
-      httpLogs = await (this.prisma as any).networkLog.findMany({
-        where: { projectId },
-        orderBy: { createdAt: 'desc' },
-        take: 100,
-        select: {
-          id: true,
-          ip: true,
-          method: true,
-          path: true,
-          host: true,
-          statusCode: true,
-          responseTimeMs: true,
-          createdAt: true,
-        },
-      });
-    } catch (err: any) {
-      this.logger.warn(`Failed to fetch httpLogs for project ${projectId}: ${err.message}`);
-    }
-
+    // Clean application runtime logs (HTTP access logs are decoupled and displayed exclusively in Network Monitor)
     return {
       logs: containerLogs.trim(),
-      httpLogs,
+      httpLogs: [],
       containerName,
     };
   }
@@ -2204,8 +2183,6 @@ export class ProjectsService implements OnModuleInit {
     return new Observable((subscriber) => {
       let proc: any;
       let heartbeatTimer: any;
-      let httpPollTimer: any;
-      let lastHttpLogTime = new Date();
 
       this.prisma.project.findFirst({
         where: { id: projectId, teamId },
@@ -2269,30 +2246,6 @@ export class ProjectsService implements OnModuleInit {
 
         startDockerLogs();
 
-        // Stream real-time HTTP website logs as they hit Traefik
-        httpPollTimer = setInterval(async () => {
-          if (subscriber.closed) return;
-          try {
-            const newHttpLogs = await (this.prisma as any).networkLog.findMany({
-              where: {
-                projectId,
-                createdAt: { gt: lastHttpLogTime },
-              },
-              orderBy: { createdAt: 'asc' },
-              take: 20,
-            });
-
-            if (newHttpLogs.length > 0) {
-              lastHttpLogTime = newHttpLogs[newHttpLogs.length - 1].createdAt;
-              for (const log of newHttpLogs) {
-                const timeStr = new Date(log.createdAt).toLocaleTimeString();
-                const formatted = `[HTTP ${timeStr}] ${log.method} ${log.path} -> ${log.statusCode} (${log.responseTimeMs || 0}ms) from ${log.ip}\n`;
-                subscriber.next({ data: { chunk: formatted, type: 'http' } });
-              }
-            }
-          } catch {}
-        }, 2000);
-
         // Keep-alive heartbeat ping every 15s to prevent Traefik/browser idle timeout
         heartbeatTimer = setInterval(() => {
           if (!subscriber.closed) {
@@ -2308,7 +2261,6 @@ export class ProjectsService implements OnModuleInit {
           try { proc.kill(); } catch {}
         }
         if (heartbeatTimer) clearInterval(heartbeatTimer);
-        if (httpPollTimer) clearInterval(httpPollTimer);
       };
     });
   }
@@ -2417,44 +2369,42 @@ export class ProjectsService implements OnModuleInit {
   }
 
   /**
-   * Writes input directly to the running container process's standard input stream (STDIN).
-   * Uses Docker socket attach with upgraded TCP connection.
+   * Non-blocking write to the running container process's STDIN stream (if supported).
    */
   async writeContainerStdin(containerName: string, input: string): Promise<boolean> {
     return new Promise((resolve) => {
-      const net = require('net');
-      const socket = net.connect('/var/run/docker.sock', () => {
-        const req = `POST /containers/${containerName}/attach?stdin=true&stream=true HTTP/1.1\r\nHost: docker\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n`;
-        socket.write(req);
-      });
+      try {
+        const net = require('net');
+        const socket = net.connect('/var/run/docker.sock');
+        let done = false;
 
-      let upgraded = false;
-      socket.on('data', () => {
-        if (!upgraded) {
-          upgraded = true;
-          socket.write(`${input}\n`);
-          setTimeout(() => {
+        const finish = (result: boolean) => {
+          if (!done) {
+            done = true;
             try { socket.destroy(); } catch {}
-            resolve(true);
-          }, 350);
-        }
-      });
+            resolve(result);
+          }
+        };
 
-      socket.on('error', (err: any) => {
-        this.logger.warn(`writeContainerStdin error on ${containerName}: ${err.message}`);
+        socket.setTimeout(600, () => finish(false));
+        socket.on('error', () => finish(false));
+
+        socket.on('connect', () => {
+          const req = `POST /containers/${containerName}/attach?stdin=1&stream=1 HTTP/1.1\r\nHost: docker\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n${input}\n`;
+          socket.write(req, () => {
+            setTimeout(() => finish(true), 100);
+          });
+        });
+      } catch {
         resolve(false);
-      });
-
-      setTimeout(() => {
-        try { socket.destroy(); } catch {}
-        resolve(upgraded);
-      }, 2000);
+      }
     });
   }
 
   /**
    * Executes a shell command inside the project's running container context,
    * or delivers standard input to a running bot/interactive process.
+   * Simulates Pterodactyl console command execution reliability.
    */
   async executeTerminalCommand(projectId: string, teamId: string, command: string): Promise<{ output: string }> {
     if (!command || typeof command !== 'string' || !command.trim()) {
@@ -2479,7 +2429,7 @@ export class ProjectsService implements OnModuleInit {
 
     // Inspect container state
     const inspectRes = await new Promise<{ status: string; running: boolean; restarting: boolean }>((resolve) => {
-      exec(`docker inspect -f '{{.State.Status}} {{.State.Running}} {{.State.Restarting}}' ${containerName}`, { timeout: 4000 }, (err, stdout) => {
+      exec(`docker inspect -f "{{.State.Status}} {{.State.Running}} {{.State.Restarting}}" ${containerName}`, { timeout: 4000 }, (err, stdout) => {
         if (err || !stdout) {
           resolve({ status: 'not_found', running: false, restarting: false });
         } else {
@@ -2495,7 +2445,6 @@ export class ProjectsService implements OnModuleInit {
 
     if (!inspectRes.running) {
       if (inspectRes.restarting) {
-        // Fetch recent crash logs to help user debug directly in terminal
         const recentLogs = await new Promise<string>((res) => {
           exec(`docker logs --tail 8 ${containerName}`, { timeout: 3000 }, (err, stdout, stderr) => {
             res((stdout || stderr || '').trim());
@@ -2503,7 +2452,7 @@ export class ProjectsService implements OnModuleInit {
         });
 
         return {
-          output: `⚠️ Container is currently in a restart loop (Status: restarting).\nCommands cannot execute while the container is restarting.\n\nRecent crash logs:\n${recentLogs || '(No logs recorded)'}\n\nTip: Check Environment Variables (e.g. database credentials) or the Logs tab to resolve startup errors.`,
+          output: `⚠️ Container is currently restarting. Commands cannot execute while container is not ready.\n\nRecent crash logs:\n${recentLogs || '(No logs recorded)'}`,
         };
       }
 
@@ -2514,65 +2463,68 @@ export class ProjectsService implements OnModuleInit {
       }
 
       return {
-        output: `Container is currently stopped (Status: ${inspectRes.status}). Please restart or redeploy the project to run commands.`,
+        output: `Container is stopped (Status: ${inspectRes.status}). Please start or redeploy the project to run commands.`,
       };
     }
 
-    // 1. Deliver input directly to container process STDIN (e.g. for running bots or interactive prompts)
-    const stdinDelivered = await this.writeContainerStdin(containerName, trimmedCmd);
+    // Execute command in container shell context (sh with bash fallback)
+    const runExec = (cmd: string, shell: 'sh' | 'bash' = 'sh'): Promise<{ code: number | null; stdout: string; stderr: string }> => {
+      return new Promise((resolve) => {
+        const proc = spawn('docker', ['exec', '-i', containerName, shell, '-c', cmd], {
+          timeout: 25000,
+        });
 
-    // 2. Also execute command in container sh context
-    return new Promise<{ output: string }>((resolve) => {
-      const proc = spawn('docker', ['exec', '-i', containerName, 'sh', '-c', trimmedCmd], {
-        timeout: 25000,
-      });
+        let stdout = '';
+        let stderr = '';
 
-      let stdout = '';
-      let stderr = '';
+        proc.stdout.on('data', (d: Buffer) => {
+          if (stdout.length < 500000) stdout += d.toString();
+        });
 
-      proc.stdout.on('data', (d: Buffer) => {
-        if (stdout.length < 200000) stdout += d.toString();
-      });
+        proc.stderr.on('data', (d: Buffer) => {
+          if (stderr.length < 500000) stderr += d.toString();
+        });
 
-      proc.stderr.on('data', (d: Buffer) => {
-        if (stderr.length < 200000) stderr += d.toString();
-      });
+        proc.on('error', (err: any) => {
+          resolve({ code: -1, stdout: '', stderr: err.message });
+        });
 
-      proc.on('error', (err: any) => {
-        if (stdinDelivered) {
-          resolve({ output: `Input sent to running container.` });
-        } else {
-          resolve({ output: `Execution failed: ${err.message}` });
-        }
-      });
-
-      proc.on('close', (code: number | null, signal: string | null) => {
-        if (signal === 'SIGTERM') {
-          resolve({ output: 'Command timed out after 25 seconds.' });
-          return;
-        }
-
-        let output = stdout.trim();
-        const errTrimmed = stderr.trim();
-
-        // If sh -c reported "not found" (common when user entered raw text meant for a bot),
-        // and stdin was delivered, return a clean confirmation instead of sh error
-        if (errTrimmed) {
-          if (stdinDelivered && (errTrimmed.includes('not found') || code === 127)) {
-            resolve({ output: output || `Input sent to running container.` });
-            return;
+        proc.on('close', (code: number | null, signal: string | null) => {
+          if (signal === 'SIGTERM') {
+            resolve({ code: 124, stdout, stderr: 'Command timed out after 25 seconds.' });
+          } else {
+            resolve({ code: code ?? 0, stdout, stderr });
           }
-          output = output ? `${output}\n${errTrimmed}` : errTrimmed;
-        }
-
-        if (!output) {
-          output = stdinDelivered
-            ? `Input sent to running container.`
-            : (code === 0 ? '(Command completed with exit code 0)' : `(Command exited with code ${code})`);
-        }
-
-        resolve({ output: output.trimEnd() });
+        });
       });
-    });
+    };
+
+    let result = await runExec(trimmedCmd, 'sh');
+
+    // If sh is not available in minimal/custom images, fallback to bash
+    if (result.code !== 0 && result.stderr.toLowerCase().includes('executable file not found') && result.stderr.includes('sh')) {
+      result = await runExec(trimmedCmd, 'bash');
+    }
+
+    let output = result.stdout.trim();
+    const errTrimmed = result.stderr.trim();
+
+    // If shell reported command not found (code 127) or error, also attempt delivering directly to STDIN of container process
+    if (result.code === 127 || (!output && errTrimmed.includes('not found'))) {
+      const stdinDelivered = await this.writeContainerStdin(containerName, trimmedCmd);
+      if (stdinDelivered) {
+        return { output: output || `[Input delivered to container process STDIN]` };
+      }
+    }
+
+    if (errTrimmed) {
+      output = output ? `${output}\n${errTrimmed}` : errTrimmed;
+    }
+
+    if (!output) {
+      output = result.code === 0 ? '(Command completed with exit code 0)' : `(Command exited with code ${result.code})`;
+    }
+
+    return { output: output.trimEnd() };
   }
 }
