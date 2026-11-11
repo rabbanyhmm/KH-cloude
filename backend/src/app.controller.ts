@@ -1933,7 +1933,9 @@ export class AppController {
 
     if (hasFile('requirements.txt') || hasFile('pipfile') || hasFile('pyproject.toml')) {
       let startCommand = 'python app.py';
-      if (hasFile('main.py')) {
+      if (hasFile('runner.py')) {
+        startCommand = 'python runner.py';
+      } else if (hasFile('main.py')) {
         startCommand = 'python main.py';
       } else if (hasFile('manage.py')) {
         startCommand = 'python manage.py runserver 0.0.0.0:8000';
@@ -2131,7 +2133,9 @@ export class AppController {
 
       if (hasFile('requirements.txt') || hasFile('pipfile') || hasFile('pyproject.toml')) {
         let startCommand = 'python app.py';
-        if (hasFile('main.py')) {
+        if (hasFile('runner.py')) {
+          startCommand = 'python runner.py';
+        } else if (hasFile('main.py')) {
           startCommand = 'python main.py';
         } else if (hasFile('manage.py')) {
           startCommand = 'python manage.py runserver 0.0.0.0:8000';

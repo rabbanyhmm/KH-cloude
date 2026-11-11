@@ -1,7 +1,7 @@
 import { Injectable, Logger, BadRequestException, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ProjectStatus, DeploymentStatus } from '@prisma/client';
-import { exec, spawn } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 import { Observable } from 'rxjs';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -9,6 +9,7 @@ import { sendDiscordNotification } from '../utils/discord-webhook';
 import { GithubAppService } from '../github-app/github-app.service';
 import { NetworkingService } from '../networking/networking.service';
 import { TraefikDriver } from '../networking/drivers/traefik.driver';
+import { getConsoleCommandPolicy, getProjectVolumeArgs, getPythonStartCommand, quoteShellArgument } from './project-runtime';
 
 @Injectable()
 export class ProjectsService implements OnModuleInit {
@@ -192,6 +193,19 @@ export class ProjectsService implements OnModuleInit {
 
   private getBaseDomain(): string {
     return process.env.BASE_DOMAIN || 'khawarahemad.com';
+  }
+
+  private async getImageVolumeArgs(projectId: string, imageTag: string): Promise<string[]> {
+    // Inspect only image metadata; never reuse host bind mounts from a container.
+    const volumesJson = await new Promise<string>((resolve, reject) => {
+      execFile('docker', ['image', 'inspect', '--format', '{{json .Config.Volumes}}', imageTag],
+        { timeout: 15000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+          if (err) reject(new Error(`Failed to inspect image volumes: ${err.message}`));
+          else resolve(stdout);
+        });
+    });
+    // Fail before replacing a container rather than silently losing persistence.
+    return getProjectVolumeArgs(projectId, JSON.parse(volumesJson));
   }
 
   private getEnvFilePaths(projectId: string) {
@@ -691,6 +705,7 @@ export class ProjectsService implements OnModuleInit {
 
         const imageTag = inspectRes.stdout.trim();
         const containerPort = project.port || 3000;
+        const volumeArgs = await this.getImageVolumeArgs(projectId, imageTag);
 
         // Get all domains including the new one
         const allDomains = await this.prisma.domain.findMany({ where: { projectId } });
@@ -718,6 +733,7 @@ export class ProjectsService implements OnModuleInit {
           '--network', 'kh-cloud-network',
           '-e', `PORT=${containerPort}`,
           ...envArgs,
+          ...volumeArgs,
           '--restart', 'unless-stopped',
           ...this.traefikDriver.getApplicationLabels(containerName, hostnames, containerPort, true) as string[],
           imageTag
@@ -948,6 +964,7 @@ export class ProjectsService implements OnModuleInit {
 
         const imageTag = inspectRes.stdout.trim();
         const containerPort = project.port || 3000;
+        const volumeArgs = await this.getImageVolumeArgs(projectId, imageTag);
 
         // Get remaining domains
         const allDomains = await this.prisma.domain.findMany({ where: { projectId } });
@@ -975,6 +992,7 @@ export class ProjectsService implements OnModuleInit {
           '--network', 'kh-cloud-network',
           '-e', `PORT=${containerPort}`,
           ...envArgs,
+          ...volumeArgs,
           '--restart', 'unless-stopped',
           ...this.traefikDriver.getApplicationLabels(containerName, hostnames, containerPort, true) as string[],
           imageTag
@@ -1760,19 +1778,14 @@ export class ProjectsService implements OnModuleInit {
           // Case 2: Python Project (requirements.txt exists)
           else if (fs.existsSync(path.join(effectiveBuildDir, 'requirements.txt'))) {
             appendLog('Detected Python application (requirements.txt found). Generating configuration...');
-            let detectedStartCommand = 'python app.py';
             let detectedPort = project.port || 8000;
-
-            const entrypoints = ['app.py', 'main.py', 'server.py', 'wsgi.py'];
-            const found = entrypoints.find(f => fs.existsSync(path.join(effectiveBuildDir, f)));
-            if (found) {
-              detectedStartCommand = `python ${found}`;
-            }
 
             const customInstall = typeof project.installCommand === 'string' ? project.installCommand.trim() : '';
             const customStart = typeof project.startCommand === 'string' ? project.startCommand.trim() : '';
             const installCmd = customInstall || 'pip install --no-cache-dir -r requirements.txt';
-            const runCmdText = customStart || project.startCommand || detectedStartCommand;
+            const runCmdText = getPythonStartCommand(
+              (file) => fs.existsSync(path.join(effectiveBuildDir, file)), customStart,
+            );
             if (customInstall) appendLog(`Using configured install command: ${customInstall}`);
             if (customStart) appendLog(`Using configured start command: ${customStart}`);
 
@@ -1865,6 +1878,11 @@ export class ProjectsService implements OnModuleInit {
           }
         }
 
+        // Resolve persistence before staging the active container. Reuse these exact
+        // mounts for the initial launch, conflict retry, and port re-detection.
+        const volumeArgs = await this.getImageVolumeArgs(projectId, imageTag);
+        const volumeFlags = volumeArgs.map(quoteShellArgument).join(' ');
+
         // 5. Update Status to Deploying
         await this.prisma.deployment.update({
           where: { id: deploymentId },
@@ -1934,6 +1952,7 @@ export class ProjectsService implements OnModuleInit {
           `--network kh-cloud-network`,
           `-e PORT=${containerPort}`,
           envFlags,
+          volumeFlags,
           `--restart unless-stopped`,
           this.traefikDriver.getApplicationLabels(containerName, hostnames, containerPort, false) as string,
           imageTag
@@ -2002,6 +2021,7 @@ export class ProjectsService implements OnModuleInit {
             `--network kh-cloud-network`,
             `-e PORT=${containerPort}`,
             envFlags,
+            volumeFlags,
             `--restart unless-stopped`,
             this.traefikDriver.getApplicationLabels(containerName, hostnames, containerPort, false) as string,
             imageTag
@@ -2496,17 +2516,23 @@ export class ProjectsService implements OnModuleInit {
     }
 
     /**
-     * Execute a one-shot shell command inside the running container and close stdin immediately.
+     * One-shot execution, not a persistent TTY. Stdin still closes immediately;
+     * recognized AGY/auth commands only get more time for non-interactive login.
      */
     const runExec = (cmd: string, shell: 'sh' | 'bash' = 'sh'): Promise<{ code: number | null; stdout: string; stderr: string }> => {
       return new Promise((resolve) => {
-        const proc = spawn('docker', ['exec', '-i', containerName, shell, '-c', cmd], {
-          timeout: 25000,
-        });
+        const { timeoutMs, timeoutMessage } = getConsoleCommandPolicy(cmd);
+        const proc = spawn('docker', ['exec', '-i', containerName, shell, '-c', cmd]);
         proc.stdin?.end();
 
         let stdout = '';
         let stderr = '';
+        const timer = setTimeout(() => {
+          // Bound the console response even if the Docker client is slow to close.
+          // Terminating that client does not guarantee the in-container process exits.
+          resolve({ code: 124, stdout, stderr: [stderr, timeoutMessage].filter(Boolean).join('\n') });
+          proc.kill('SIGTERM');
+        }, timeoutMs);
 
         proc.stdout.on('data', (d: Buffer) => {
           if (stdout.length < 500000) stdout += d.toString();
@@ -2517,15 +2543,13 @@ export class ProjectsService implements OnModuleInit {
         });
 
         proc.on('error', (err: any) => {
+          clearTimeout(timer);
           resolve({ code: -1, stdout: '', stderr: err.message });
         });
 
-        proc.on('close', (code: number | null, signal: string | null) => {
-          if (signal === 'SIGTERM') {
-            resolve({ code: 124, stdout, stderr: 'Command timed out after 25 seconds.' });
-          } else {
-            resolve({ code: code ?? 0, stdout, stderr });
-          }
+        proc.on('close', (code: number | null) => {
+          clearTimeout(timer);
+          resolve({ code: code ?? 0, stdout, stderr });
         });
       });
     };
