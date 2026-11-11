@@ -789,7 +789,8 @@ export class StorageService {
   }
 
   generateMockToken(bucketId: string, key: string, expiresIn = 3600): string {
-    const secret = process.env.JWT_SECRET || 'khcloud-storage-super-secret-key-123';
+    const { getJwtSecret } = require('../auth/token.service');
+    const secret = getJwtSecret();
     const exp = Date.now() + expiresIn * 1000;
     const payload = `${bucketId}:${key}:${exp}`;
     const hmac = crypto
@@ -802,14 +803,17 @@ export class StorageService {
 
   verifyMockToken(bucketId: string, key: string, token: string): boolean {
     try {
+      const { getJwtSecret } = require('../auth/token.service');
       const decoded = Buffer.from(token, 'base64url').toString('utf-8');
       const [expStr, hmac] = decoded.split(':');
       const exp = parseInt(expStr, 10);
-      if (Date.now() > exp) return false;
-      const secret = process.env.JWT_SECRET || 'khcloud-storage-super-secret-key-123';
+      if (!exp || Date.now() > exp || !hmac) return false;
+      const secret = getJwtSecret();
       const payload = `${bucketId}:${key}:${exp}`;
       const expectedHmac = crypto.createHmac('sha256', secret).update(payload).digest('hex').substring(0, 16);
-      return hmac === expectedHmac;
+      const a = Buffer.from(hmac, 'utf8');
+      const b = Buffer.from(expectedHmac, 'utf8');
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
     } catch {
       return false;
     }

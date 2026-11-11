@@ -16,7 +16,7 @@ import EdgeFunctionsTab from '@/components/EdgeFunctionsTab';
 import SettingsTab from '@/components/SettingsTab';
 import BackupsTab from '@/components/BackupsTab';
 import MailTab from '@/components/MailTab';
-import { apiRequest, getDomainUrl, getBaseDomain, getApiBase } from '@/lib/api';
+import { apiRequest, getDomainUrl, getBaseDomain, getApiBase, getSafeRedirectUrl } from '@/lib/api';
 import { Shield } from 'lucide-react';
 
 type ViewMode = 'landing' | 'auth' | 'dashboard';
@@ -123,12 +123,9 @@ export default function Home() {
         const stateFromParam = params.get('state') || '';
         const pendingTeamId = localStorage.getItem('github_app_pending_teamId') || '';
 
-        // Use GitHub returned state if present; otherwise fallback to encoded teamId
-        const stateToSend = stateFromParam || (pendingTeamId ? btoa(JSON.stringify({ teamId: pendingTeamId })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') : '');
-
         const queryParts = [
           `installation_id=${encodeURIComponent(installationId)}`,
-          stateToSend ? `state=${encodeURIComponent(stateToSend)}` : '',
+          stateFromParam ? `state=${encodeURIComponent(stateFromParam)}` : '',
           pendingTeamId ? `teamId=${encodeURIComponent(pendingTeamId)}` : '',
           'format=json',
         ].filter(Boolean);
@@ -146,7 +143,8 @@ export default function Home() {
       return;
     }
 
-    const sessionDataParam = params.get('session_data');
+    const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const sessionDataParam = hashParams.get('session_data') || params.get('session_data');
     if (sessionDataParam) {
       try {
         const data = JSON.parse(decodeURIComponent(sessionDataParam));
@@ -177,9 +175,10 @@ export default function Home() {
             return;
           }
           const params = new URLSearchParams(window.location.search);
-          const redirectDest = params.get('redirect') || getDomainUrl('cloud');
+          const redirectDest = getSafeRedirectUrl(params.get('redirect'), getDomainUrl('cloud'));
+          const baseRedirect = redirectDest.split('#')[0].split('?')[0];
           const sessionPayload = encodeURIComponent(JSON.stringify({ user, teams: useAppStore.getState().teams, accessToken }));
-          window.location.href = `${redirectDest}?session_data=${sessionPayload}`;
+          window.location.href = `${baseRedirect}#session_data=${sessionPayload}`;
         } else {
           setView('auth');
         }
