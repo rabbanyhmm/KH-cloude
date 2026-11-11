@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useAppStore } from '@/lib/store';
 import { apiRequest, getBaseDomain, getApiBase } from '@/lib/api';
 import { useTeamRole } from '@/lib/rbac';
-import { Layers, Plus, Settings, RefreshCw, Terminal, Eye, EyeOff, Globe, Server, Play, ArrowLeft, Loader2, Database, Lock, Unlock, ChevronDown, Building2, User, ExternalLink, Link2, Check, Sparkles, FolderGit2, Trash2, Search, ArrowRight, ShieldCheck, Rocket } from 'lucide-react';
+import { Layers, Plus, Settings, RefreshCw, Terminal, Eye, EyeOff, Globe, Server, Play, ArrowLeft, Loader2, Database, Lock, Unlock, ChevronDown, Building2, User, ExternalLink, Link2, Check, Sparkles, FolderGit2, Trash2, Search, ArrowRight, ArrowDown, ShieldCheck, Rocket } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useDialog } from './CustomDialogProvider';
 import NetworkMonitorTab from './NetworkMonitorTab';
@@ -141,13 +141,18 @@ export default function ProjectsTab() {
   // Active details tab
   const [detailsTab, setDetailsTab] = useState<'deployments' | 'env' | 'networking' | 'metrics' | 'network' | 'console' | 'terminal' | 'settings'>('deployments');
   const [runtimeLogs, setRuntimeLogs] = useState<string[]>(['Fetching runtime logs...']);
-  const [logFilter, setLogFilter] = useState<'all' | 'app' | 'http'>('all');
+  const [logFilter, setLogFilter] = useState<'all' | 'errors'>('all');
   const [logSearch, setLogSearch] = useState('');
   const [logsLoading, setLogsLoading] = useState(false);
   const [isLogStreaming, setIsLogStreaming] = useState(false);
   const [consoleInput, setConsoleInput] = useState('');
   const [consoleRunning, setConsoleRunning] = useState(false);
+  const [autoScroll, setAutoScroll] = useState<boolean>(true);
+  const [commandHistoryByProject, setCommandHistoryByProject] = useState<Record<string, string[]>>({});
+  const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  const commandHistory = activeProjectId ? (commandHistoryByProject[activeProjectId] || []) : [];
   const logScrollRef = useRef<HTMLDivElement>(null);
+  const lastContainerTailRef = useRef<string[]>([]);
   const terminalScrollRef = useRef<HTMLDivElement>(null);
 
   const [terminalInput, setTerminalInput] = useState('');
@@ -614,23 +619,65 @@ export default function ProjectsTab() {
     return () => clearInterval(interval);
   }, [activeProjectId, detailsTab]);
 
+  const isErrorConsoleLine = (line: string) =>
+    !line.startsWith('[System]') && /error|exception|fail|crash|fatal/i.test(line);
+
+  const isWarningConsoleLine = (line: string) =>
+    !line.startsWith('[System]') && /warn|warning/i.test(line);
+
+  const isErrorOrWarningLine = (line: string) =>
+    isErrorConsoleLine(line) || isWarningConsoleLine(line);
+
+  /**
+   * Compute suffix-to-prefix overlap length between a tracked container log tail and a refreshed snapshot.
+   */
+  const computeSnapshotOverlap = (prevTail: string[], nextLines: string[]): number => {
+    const maxOverlap = Math.min(prevTail.length, nextLines.length);
+    for (let k = maxOverlap; k >= 1; k--) {
+      const offset = prevTail.length - k;
+      let matches = true;
+      for (let i = 0; i < k; i++) {
+        if (prevTail[offset + i] !== nextLines[i]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return k;
+    }
+    return 0;
+  };
+
+  useEffect(() => {
+    setHistoryIndex(-1);
+    setConsoleInput('');
+    lastContainerTailRef.current = [];
+  }, [activeProjectId]);
+
   const fetchRuntimeLogs = async (silent = false) => {
     if (!activeProjectId || !activeTeam?.id) return;
     if (!silent) setLogsLoading(true);
     try {
       const data = await apiRequest(`/projects/${activeProjectId}/runtime-logs?teamId=${activeTeam.id}`);
-      if (data?.logs || Array.isArray(data?.httpLogs)) {
-        const lines = (data.logs || '').split('\n').filter((l: string) => l.trim() !== '');
-        const httpLines: string[] = [];
-        if (Array.isArray(data.httpLogs)) {
-          for (const log of data.httpLogs.slice().reverse()) {
-            const timeStr = new Date(log.createdAt).toLocaleTimeString();
-            httpLines.push(`[HTTP ${timeStr}] ${log.method} ${log.path} -> ${log.statusCode} (${log.responseTimeMs || 0}ms) from ${log.ip}`);
+      if (data?.logs) {
+        const rawLines = (data.logs || '')
+          .split('\n')
+          .filter((l: string) => l.trim() !== '');
+
+        setRuntimeLogs((prev) => {
+          if (!silent || prev.length <= 1) {
+            const initial = rawLines.slice(-300);
+            lastContainerTailRef.current = initial;
+            return initial;
           }
-        }
-        const combined = [...lines, ...httpLines];
-        setRuntimeLogs(combined.length > 300 ? combined.slice(combined.length - 300) : combined);
+          const overlap = computeSnapshotOverlap(lastContainerTailRef.current, rawLines);
+          const newLines = rawLines.slice(overlap);
+          if (newLines.length === 0) return prev;
+          lastContainerTailRef.current = [...lastContainerTailRef.current, ...newLines].slice(-500);
+          const merged = [...prev, ...newLines];
+          return merged.length > 500 ? merged.slice(merged.length - 500) : merged;
+        });
       } else if (!silent) {
+        lastContainerTailRef.current = [];
         setRuntimeLogs(['[System] No container output recorded yet.']);
       }
     } catch (err: any) {
@@ -642,11 +689,12 @@ export default function ProjectsTab() {
     }
   };
 
-  // Setup SSE for runtime logs & live website traffic
+  // Setup SSE for container runtime logs (Pterodactyl console stream)
   useEffect(() => {
     if (!activeProjectId || !activeTeam?.id || detailsTab !== 'console') return;
     
     let isSubscribed = true;
+    let streamOpen = false;
     let eventSource: EventSource | null = null;
     let fallbackPollTimer: any = null;
 
@@ -670,6 +718,7 @@ export default function ProjectsTab() {
 
       eventSource.onopen = () => {
         if (!isSubscribed) return;
+        streamOpen = true;
         setIsLogStreaming(true);
       };
 
@@ -677,49 +726,68 @@ export default function ProjectsTab() {
         if (!isSubscribed) return;
         try {
           const data = JSON.parse(event.data);
+          if (data.type === 'http') return; // Ignore any HTTP access traces
           if (data.chunk && data.chunk.trim() !== '') {
-            const lines = data.chunk.split('\n').filter((l: string) => l.trim() !== '');
-            setRuntimeLogs((prev) => {
-              const newLogs = [...prev, ...lines];
-              return newLogs.length > 300 ? newLogs.slice(newLogs.length - 300) : newLogs;
-            });
+            const lines = data.chunk
+              .split('\n')
+              .filter((l: string) => l.trim() !== '');
+            if (lines.length > 0) {
+              lastContainerTailRef.current = [...lastContainerTailRef.current, ...lines].slice(-500);
+              setRuntimeLogs((prev) => {
+                const newLogs = [...prev, ...lines];
+                return newLogs.length > 500 ? newLogs.slice(newLogs.length - 500) : newLogs;
+              });
+            }
           }
         } catch {
           if (event.data && typeof event.data === 'string' && event.data.trim()) {
-            setRuntimeLogs((prev) => [...prev, event.data].slice(-300));
+            lastContainerTailRef.current = [...lastContainerTailRef.current, event.data].slice(-500);
+            setRuntimeLogs((prev) => [...prev, event.data].slice(-500));
           }
         }
       };
 
       eventSource.onerror = () => {
         if (!isSubscribed) return;
+        streamOpen = false;
         setIsLogStreaming(false);
       };
     } catch {
+      streamOpen = false;
       setIsLogStreaming(false);
     }
 
-    // 3. Fallback poll every 8 seconds to ensure logs never freeze if SSE is blocked
+    // 3. Fallback poll every 8 seconds only if live SSE stream is not active
     fallbackPollTimer = setInterval(() => {
-      if (isSubscribed) {
+      if (isSubscribed && !streamOpen) {
         fetchRuntimeLogs(true);
       }
     }, 8000);
 
     return () => {
       isSubscribed = false;
+      streamOpen = false;
       setIsLogStreaming(false);
       if (eventSource) eventSource.close();
       if (fallbackPollTimer) clearInterval(fallbackPollTimer);
     };
   }, [activeProjectId, activeTeam?.id, detailsTab, accessToken]);
 
-  // Auto-scroll log and terminal windows as new output arrives
+  // Smart auto-scroll: auto-scroll to bottom only when user is at the bottom (Pterodactyl behavior)
   useEffect(() => {
-    if (logScrollRef.current) {
+    if (autoScroll && logScrollRef.current) {
       logScrollRef.current.scrollTop = logScrollRef.current.scrollHeight;
     }
-  }, [runtimeLogs]);
+  }, [runtimeLogs, autoScroll]);
+
+  const handleLogScroll = () => {
+    if (!logScrollRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = logScrollRef.current;
+    // When distance from bottom is within 40px, user is at bottom -> keep auto-scroll active
+    // If user scrolled up, pause auto-scroll so the screen doesn't jump
+    const isAtBottom = scrollHeight - scrollTop - clientHeight <= 40;
+    setAutoScroll(isAtBottom);
+  };
 
   useEffect(() => {
     if (terminalScrollRef.current) {
@@ -730,6 +798,9 @@ export default function ProjectsTab() {
   const executeUnifiedCommand = async (rawCmd: string, target: 'logs' | 'terminal') => {
     const cmd = rawCmd.trim();
     if (!cmd || !activeProjectId || !activeTeam) return;
+
+    // Immediately enable autoScroll and scroll to bottom so the user sees their command output
+    setAutoScroll(true);
 
     const append = (msg: string) => {
       if (target === 'logs') {
@@ -804,9 +875,9 @@ export default function ProjectsTab() {
       return;
     }
 
-    // 7. General Shell Command (e.g. ls -la, pwd, env, python, /sh <cmd>, etc.)
+    // 7. General Shell Command or Input (e.g. ls -la, pwd, env, python, /sh <cmd>, etc.)
     const execCmd = cmd.startsWith('/sh ') ? cmd.substring(4).trim() : cmd;
-    append(target === 'logs' ? `[Exec] $ ${execCmd}` : `$ ${execCmd}`);
+    append(target === 'logs' ? `> ${execCmd}` : `$ ${execCmd}`);
 
     if (target === 'logs') setConsoleRunning(true);
     else setTerminalRunning(true);
@@ -824,6 +895,13 @@ export default function ProjectsTab() {
     } finally {
       if (target === 'logs') setConsoleRunning(false);
       else setTerminalRunning(false);
+      if (target !== 'logs') {
+        setTimeout(() => {
+          if (terminalScrollRef.current) {
+            terminalScrollRef.current.scrollTop = terminalScrollRef.current.scrollHeight;
+          }
+        }, 50);
+      }
     }
   };
 
@@ -835,11 +913,37 @@ export default function ProjectsTab() {
     void executeUnifiedCommand(cmd, 'terminal');
   };
 
+  const handleConsoleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (commandHistory.length === 0) return;
+      const nextIdx = historyIndex < commandHistory.length - 1 ? historyIndex + 1 : historyIndex;
+      setHistoryIndex(nextIdx);
+      setConsoleInput(commandHistory[commandHistory.length - 1 - nextIdx]);
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (historyIndex > 0) {
+        const nextIdx = historyIndex - 1;
+        setHistoryIndex(nextIdx);
+        setConsoleInput(commandHistory[commandHistory.length - 1 - nextIdx]);
+      } else if (historyIndex === 0) {
+        setHistoryIndex(-1);
+        setConsoleInput('');
+      }
+    }
+  };
+
   const handleConsoleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!consoleInput.trim() || !activeProjectId || !activeTeam || consoleRunning) return;
     const cmd = consoleInput.trim();
     setConsoleInput('');
+    setHistoryIndex(-1);
+    setCommandHistoryByProject((prev) => {
+      const projectHist = prev[activeProjectId] || [];
+      if (projectHist[projectHist.length - 1] === cmd) return prev;
+      return { ...prev, [activeProjectId]: [...projectHist, cmd].slice(-50) };
+    });
     void executeUnifiedCommand(cmd, 'logs');
   };
 
@@ -1975,39 +2079,39 @@ export default function ProjectsTab() {
                 </div>
               )}
 
-              {/* ── Runtime Logs & Website Traffic ── */}
+              {/* ── Runtime Console (Pterodactyl Simulation) ── */}
               {detailsTab === 'console' && (() => {
+                const searchTerm = logSearch.trim().toLowerCase();
                 const filteredLogs = runtimeLogs.filter(line => {
-                  if (logFilter === 'app' && (line.startsWith('[HTTP ') || line.startsWith('[HTTP]'))) return false;
-                  if (logFilter === 'http' && !(line.startsWith('[HTTP ') || line.startsWith('[HTTP]'))) return false;
-                  if (logSearch.trim() && !line.toLowerCase().includes(logSearch.toLowerCase().trim())) return false;
+                  if (logFilter === 'errors' && !isErrorOrWarningLine(line)) return false;
+                  if (searchTerm && !line.toLowerCase().includes(searchTerm)) return false;
                   return true;
                 });
 
-                const appCount = runtimeLogs.filter(l => !l.startsWith('[HTTP ') && !l.startsWith('[HTTP]')).length;
-                const httpCount = runtimeLogs.filter(l => l.startsWith('[HTTP ') || l.startsWith('[HTTP]')).length;
+                const cleanAppLogs = runtimeLogs;
+                const errorCount = cleanAppLogs.filter(isErrorOrWarningLine).length;
 
                 return (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px' }}>
                       <div>
                         <div style={{ fontSize: '11px', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.07em', color: '#4b5563', marginBottom: '2px' }}>
-                          Runtime Console &amp; Website Logs
+                          Container Console
                         </div>
                         <div style={{ fontSize: '12px', color: '#6b7280' }}>
-                          Live stdout/stderr stream from container + incoming HTTP website traffic from Traefik edge.
+                          Live stdout/stderr stream from container context and interactive execution.
                         </div>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                         {isLogStreaming ? (
                           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '11px', fontWeight: 600, color: '#22c55e', backgroundColor: 'rgba(34,197,94,0.1)', padding: '4px 10px', borderRadius: '9999px', border: '1px solid rgba(34,197,94,0.25)' }}>
                             <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#22c55e' }} className="animate-pulse" />
-                            Live SSE Stream
+                            Live Stream
                           </span>
                         ) : (
                           <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '11px', fontWeight: 600, color: '#fbbf24', backgroundColor: 'rgba(245,158,11,0.1)', padding: '4px 10px', borderRadius: '9999px', border: '1px solid rgba(245,158,11,0.25)' }}>
                             <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: '#fbbf24' }} />
-                            Auto-Polling (8s)
+                            Connecting...
                           </span>
                         )}
                         <button
@@ -2032,9 +2136,8 @@ export default function ProjectsTab() {
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '10px', backgroundColor: '#111318', padding: '8px 12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.06)' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                         {[
-                          { id: 'all', label: `All Logs (${runtimeLogs.length})` },
-                          { id: 'app', label: `App Output (${appCount})` },
-                          { id: 'http', label: `Website Requests (${httpCount})` },
+                          { id: 'all', label: `All Output (${cleanAppLogs.length})` },
+                          { id: 'errors', label: `Errors & Warnings (${errorCount})` },
                         ].map((tab) => (
                           <button
                             key={tab.id}
@@ -2076,11 +2179,12 @@ export default function ProjectsTab() {
                       </div>
                     </div>
 
-                    {/* Unified Console Container (Logs + Interactive Command Bar) */}
-                    <div style={{ backgroundColor: '#08090c', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '10px', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-                      {/* Main Log Window */}
+                    {/* Unified Console Container (Pterodactyl-style layout) */}
+                    <div style={{ position: 'relative', backgroundColor: '#08090c', border: '1px solid rgba(255,255,255,0.06)', borderRadius: '10px', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                      {/* Main Log Window with User Scroll-Lock Detection */}
                       <div
                         ref={logScrollRef}
+                        onScroll={handleLogScroll}
                         style={{
                           fontFamily: '"JetBrains Mono", "Fira Code", monospace',
                           fontSize: '12px',
@@ -2098,24 +2202,18 @@ export default function ProjectsTab() {
                             No matching logs found.
                           </div>
                         ) : (
-                          filteredLogs.map((line, idx) => {
-                            const isHttp = line.startsWith('[HTTP ') || line.startsWith('[HTTP]');
+                          filteredLogs.map((rawLine, idx) => {
+                            const line = rawLine.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
                             const isSystem = line.startsWith('[System]');
-                            const isExec = line.startsWith('[Exec]');
-                            const isErr = !isHttp && !isSystem && (/error|exception|fail|crash|fatal/i.test(line));
-                            const isWarn = !isHttp && !isSystem && (/warn|warning/i.test(line));
+                            const isExec = line.startsWith('[Exec]') || line.startsWith('>') || line.startsWith('$');
+                            const isErr = isErrorConsoleLine(line);
+                            const isWarn = isWarningConsoleLine(line);
 
-                            let color = '#9ba3af';
+                            let color = '#e2e8f0';
                             if (isExec) color = '#c4b5fd';
                             else if (isSystem) color = '#38bdf8';
                             else if (isErr) color = '#f87171';
                             else if (isWarn) color = '#fbbf24';
-                            else if (isHttp) {
-                              if (/-> 5\d\d/.test(line)) color = '#ef4444';
-                              else if (/-> 4\d\d/.test(line)) color = '#fbbf24';
-                              else if (/-> 2\d\d|-> 3\d\d/.test(line)) color = '#22c55e';
-                              else color = '#a78bfa';
-                            }
 
                             return (
                               <div key={idx} style={{ color, display: 'flex', gap: '8px', alignItems: 'baseline' }}>
@@ -2136,7 +2234,42 @@ export default function ProjectsTab() {
                         )}
                       </div>
 
-                      {/* Interactive Console Command Input Bar */}
+                      {/* Floating Auto-Scroll Paused Indicator (Pterodactyl UX) */}
+                      {!autoScroll && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (logScrollRef.current) {
+                              logScrollRef.current.scrollTop = logScrollRef.current.scrollHeight;
+                              setAutoScroll(true);
+                            }
+                          }}
+                          style={{
+                            position: 'absolute',
+                            bottom: '56px',
+                            right: '16px',
+                            backgroundColor: '#7c3aed',
+                            color: '#ffffff',
+                            padding: '5px 12px',
+                            borderRadius: '9999px',
+                            fontSize: '11px',
+                            fontWeight: 600,
+                            boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+                            border: '1px solid rgba(255,255,255,0.2)',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            zIndex: 20,
+                            transition: 'all 0.15s ease',
+                          }}
+                          className="hover:bg-violet-600 active:scale-95"
+                        >
+                          <ArrowDown size={12} /> Auto-scroll paused • Scroll to bottom
+                        </button>
+                      )}
+
+                      {/* Interactive Console Command Input Bar (with history navigation) */}
                       <form
                         onSubmit={handleConsoleSubmit}
                         style={{
@@ -2155,7 +2288,8 @@ export default function ProjectsTab() {
                           type="text"
                           value={consoleInput}
                           onChange={(e) => setConsoleInput(e.target.value)}
-                          placeholder="Enter command or input to running container..."
+                          onKeyDown={handleConsoleKeyDown}
+                          placeholder="Type command or input to container (↑/↓ for history)..."
                           disabled={consoleRunning}
                           style={{
                             flex: 1,
