@@ -2530,6 +2530,13 @@ export class ProjectsService implements OnModuleInit {
       });
     };
 
+    // Support explicit STDIN delivery if user prefixes with /stdin or /input
+    if (trimmedCmd.startsWith('/stdin ') || trimmedCmd.startsWith('/input ')) {
+      const rawInput = trimmedCmd.replace(/^\/(stdin|input)\s+/, '');
+      const stdinDelivered = await this.writeContainerStdin(containerName, rawInput);
+      return { output: stdinDelivered ? `[Delivered to container STDIN: ${rawInput}]` : `[Failed to write to container STDIN]` };
+    }
+
     let result = await runExec(trimmedCmd, 'sh');
 
     // If sh is not available in minimal/custom images, fallback to bash
@@ -2539,14 +2546,6 @@ export class ProjectsService implements OnModuleInit {
 
     let output = result.stdout.trim();
     const errTrimmed = result.stderr.trim();
-
-    // If shell reported command not found (code 127) or error, also attempt delivering directly to STDIN of container process
-    if (result.code === 127 || (!output && errTrimmed.includes('not found'))) {
-      const stdinDelivered = await this.writeContainerStdin(containerName, trimmedCmd);
-      if (stdinDelivered) {
-        return { output: output || `[Input delivered to container process STDIN]` };
-      }
-    }
 
     if (errTrimmed) {
       output = output ? `${output}\n${errTrimmed}` : errTrimmed;
