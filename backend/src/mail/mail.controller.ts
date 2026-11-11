@@ -9,6 +9,7 @@ import {
   Req,
   Headers,
   UnauthorizedException,
+  ForbiddenException,
   BadRequestException,
 } from '@nestjs/common';
 import { MailService } from './mail.service';
@@ -47,18 +48,26 @@ export class MailController {
       }
     }
 
-    // 2. Check session user
+    // 2. Check session user and strictly verify team membership
     const user = req.user;
-    if (user) {
-      if (explicitTeamId) return explicitTeamId;
-      // Find team for user
+    if (user?.id) {
+      if (explicitTeamId) {
+        const authUser = await this.prisma.user.findUnique({ where: { id: user.id } });
+        if (authUser?.role === 'ADMIN') return explicitTeamId;
+        const member = await this.prisma.teamMember.findUnique({
+          where: { teamId_userId: { teamId: explicitTeamId, userId: user.id } },
+        });
+        if (!member) {
+          throw new ForbiddenException('Access denied. You are not a member of this team workspace.');
+        }
+        return explicitTeamId;
+      }
+      // Find default team for user
       const membership = await this.prisma.teamMember.findFirst({
         where: { userId: user.id },
       });
       if (membership) return membership.teamId;
     }
-
-    if (explicitTeamId) return explicitTeamId;
 
     throw new UnauthorizedException('Please authenticate with a session or Bearer Mail API Key.');
   }

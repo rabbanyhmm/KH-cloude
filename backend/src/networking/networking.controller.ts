@@ -17,7 +17,7 @@ export class NetworkingController {
   ) {}
 
   private getUserId(req: any): string {
-    const userId = req.user?.id || req.headers?.['x-user-id'] || req.query?.userId;
+    const userId = req.user?.id;
     if (!userId) {
       throw new UnauthorizedException('Authentication required.');
     }

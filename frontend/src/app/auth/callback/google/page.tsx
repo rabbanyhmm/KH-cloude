@@ -3,7 +3,7 @@
 import React, { useEffect, useState, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useAppStore } from '@/lib/store';
-import { apiRequest } from '@/lib/api';
+import { apiRequest, getSafeRedirectUrl } from '@/lib/api';
 import { Loader2, ShieldAlert } from 'lucide-react';
 
 function GoogleCallbackContent() {
@@ -45,11 +45,12 @@ function GoogleCallbackContent() {
         });
 
         // Check if we need to forward this session back to a redirected subdomain
-        const redirectDest = localStorage.getItem('auth_redirect_dest');
-        if (redirectDest) {
+        const rawRedirectDest = localStorage.getItem('auth_redirect_dest');
+        if (rawRedirectDest) {
           localStorage.removeItem('auth_redirect_dest');
+          const safeDest = getSafeRedirectUrl(rawRedirectDest).split('#')[0].split('?')[0];
           const sessionPayload = encodeURIComponent(JSON.stringify(data));
-          window.location.href = `${redirectDest}?session_data=${sessionPayload}`;
+          window.location.href = `${safeDest}#session_data=${sessionPayload}`;
         } else {
           // Save session in Zustand store locally
           setUser(data.user);

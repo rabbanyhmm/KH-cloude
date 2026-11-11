@@ -1297,13 +1297,50 @@ export class ProjectsService implements OnModuleInit {
     const logs: string[] = [];
     this.deploymentLogs.set(deploymentId, logs);
 
+    const redactSecrets = (line: string): string =>
+      line
+        .replace(/(https?:\/\/[^:\s/@]+:)[^@\s/]+(@)/gi, '$1***$2')
+        .replace(/\b(gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,})\b/g, '***');
+
     const appendLog = (line: string) => {
-      const formatted = `[${new Date().toISOString()}] ${line}`;
+      const formatted = `[${new Date().toISOString()}] ${redactSecrets(line)}`;
       logs.push(formatted);
       this.prisma.deployment.update({
         where: { id: deploymentId },
         data: { buildLogs: logs.join('\n') },
       }).catch(() => null);
+    };
+
+    const runArgCmd = (bin: string, args: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> => {
+      return new Promise((resolve) => {
+        const proc = execFile(bin, args, {
+          cwd,
+          maxBuffer: 1024 * 1024 * 50,
+          env: {
+            ...process.env,
+            GIT_TERMINAL_PROMPT: '0',
+          },
+        });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout?.on('data', (data) => {
+          const str = data.toString();
+          stdout += str;
+          str.split('\n').forEach((line: string) => {
+            if (line.trim()) appendLog(line);
+          });
+        });
+        proc.stderr?.on('data', (data) => {
+          const str = data.toString();
+          stderr += str;
+          str.split('\n').forEach((line: string) => {
+            if (line.trim()) appendLog(`[stderr] ${line}`);
+          });
+        });
+        proc.on('close', (code) => {
+          resolve({ code: code ?? 0, stdout, stderr });
+        });
+      });
     };
 
     const runCmd = (cmd: string, cwd?: string, customEnv: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> => {
@@ -1546,7 +1583,13 @@ export class ProjectsService implements OnModuleInit {
         }
 
         const maskedRepoUrl = `https://github.com/${repoFullName}.git`;
+        if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoFullName)) {
+          throw new Error(`Invalid GitHub repository format: "${repoFullName}"`);
+        }
         const branch = project.githubBranch || 'main';
+        if (!/^[a-zA-Z0-9._\/-]{1,255}$/.test(branch) || branch.includes('..')) {
+          throw new Error(`Invalid GitHub branch name: "${branch}"`);
+        }
         let cloneRes: { code: number; stdout: string; stderr: string } | null = null;
         const tryClone = async (token: string | null, source: string) => {
           const url = token
@@ -1555,8 +1598,8 @@ export class ProjectsService implements OnModuleInit {
           appendLog(`Cloning branch "${branch}" from ${maskedRepoUrl} (auth: ${source})`);
           // For rollbacks we need enough history to reach the target commit.
           // For normal deploys --depth 1 is fine (fastest, smallest clone).
-          const cloneDepth = targetCommitHash ? '--depth 50' : '--depth 1';
-          return runCmd(`git clone ${cloneDepth} -b ${branch} "${url}" .`, buildDir);
+          const cloneDepthArgs = targetCommitHash ? ['--depth', '50'] : ['--depth', '1'];
+          return runArgCmd('git', ['clone', ...cloneDepthArgs, '-b', branch, url, '.'], buildDir);
         };
 
         for (const t of installTokens) {
@@ -1603,13 +1646,16 @@ export class ProjectsService implements OnModuleInit {
         // 2a. For rollbacks: check out the exact commit after cloning.
         // If --depth 50 didn't reach far enough, deepen until we find it.
         if (targetCommitHash) {
+          if (!/^[0-9a-f]{4,40}$/i.test(targetCommitHash)) {
+            throw new Error(`Invalid rollback commit hash: "${targetCommitHash}"`);
+          }
           appendLog(`[Rollback] Checking out exact commit ${targetCommitHash}...`);
-          let checkoutRes = await runCmd(`git checkout ${targetCommitHash}`, buildDir);
+          let checkoutRes = await runArgCmd('git', ['checkout', targetCommitHash], buildDir);
           if (checkoutRes.code !== 0) {
             // Commit not in shallow history — deepen and retry once
             appendLog(`[Rollback] Commit not in shallow clone, fetching deeper history...`);
-            await runCmd(`git fetch --deepen=200 origin ${project.githubBranch || 'main'}`, buildDir);
-            checkoutRes = await runCmd(`git checkout ${targetCommitHash}`, buildDir);
+            await runArgCmd('git', ['fetch', '--deepen=200', 'origin', branch], buildDir);
+            checkoutRes = await runArgCmd('git', ['checkout', targetCommitHash], buildDir);
           }
           if (checkoutRes.code !== 0) {
             throw new Error(
@@ -1619,6 +1665,12 @@ export class ProjectsService implements OnModuleInit {
           }
           appendLog(`[Rollback] Successfully checked out commit ${targetCommitHash}.`);
         }
+
+        // Scrub .git directory immediately after clone/checkout so any embedded
+        // remote token in .git/config is never exposed inside Docker build layers.
+        try {
+          fs.rmSync(path.join(buildDir, '.git'), { recursive: true, force: true });
+        } catch { /* ignore */ }
 
         // Compute effective build directory if project.rootDirectory is configured
         let effectiveBuildDir = buildDir;
@@ -1839,8 +1891,8 @@ export class ProjectsService implements OnModuleInit {
         // Docker's 'COPY . .' will skip them, causing missing env vars during the build.
         const dockerignorePath = path.join(effectiveBuildDir, '.dockerignore');
         if (fs.existsSync(dockerignorePath)) {
-          fs.appendFileSync(dockerignorePath, '\n# Auto-injected by KH Cloud to ensure env vars are available during build\n!.env\n!.env.production\n!.env.local\n');
-          appendLog(`[Env Engine] Patched .dockerignore to ensure build-time environment variables are accessible.`);
+          fs.appendFileSync(dockerignorePath, '\n# Auto-injected by KH Cloud to exclude git metadata and allow build-time env vars\n.git\n!.env\n!.env.production\n!.env.local\n');
+          appendLog(`[Env Engine] Patched .dockerignore to exclude .git and ensure build-time environment variables are accessible.`);
         }
 
         // 4. Build Docker Image (BuildKit Engine with Smart Layer Recovery)
