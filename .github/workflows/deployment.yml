@@ -1,0 +1,100 @@
+name: Deploy to Production VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy KH Cloud to VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify Required Secrets
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.VPS_HOST }}" ] || [ -z "${{ secrets.VPS_USER }}" ]; then
+            echo "::error::Missing VPS_HOST or VPS_USER repository secrets."
+            echo "Set VPS_HOST, VPS_USER, and VPS_SSH_KEY (or VPS_PASSWORD) in GitHub -> Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          if [ -z "${{ secrets.VPS_SSH_KEY }}" ] && [ -z "${{ secrets.VPS_PASSWORD }}" ]; then
+            echo "::error::Missing authentication secret. Set either VPS_SSH_KEY or VPS_PASSWORD in GitHub Secrets."
+            exit 1
+          fi
+
+      - name: Deploy via SSH to VPS
+        uses: appleboy/ssh-action@v1
+        env:
+          SUDO_PASS: ${{ secrets.VPS_SUDO_PASSWORD || secrets.VPS_PASSWORD }}
+          DEPLOY_PATH: ${{ vars.VPS_DEPLOY_PATH || '/root/kh-cloud' }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 20m
+          envs: SUDO_PASS,DEPLOY_PATH
+          script: |
+            set -euo pipefail
+
+            run_privileged() {
+              if [ "$(id -u)" -eq 0 ]; then
+                bash -c "exec </dev/null; $1"
+              elif [ -n "${SUDO_PASS:-}" ]; then
+                printf '%s\n' "$SUDO_PASS" | sudo -k -S -p '' bash -c "exec </dev/null; $1"
+              else
+                sudo -n bash -c "exec </dev/null; $1"
+              fi
+            }
+
+            echo "=== [1/4] Updating repository on main branch in ${DEPLOY_PATH} ==="
+            run_privileged "
+              set -e
+              cd '${DEPLOY_PATH}'
+              git fetch origin main
+              git checkout main
+              git pull --ff-only origin main
+              git log -1 --oneline
+            "
+
+            echo "=== [2/4] Building & restarting containers ==="
+            run_privileged "
+              set -e
+              cd '${DEPLOY_PATH}'
+              export DOCKER_BUILDKIT=1
+              export COMPOSE_DOCKER_CLI_BUILD=1
+              docker compose -f docker-compose.prod.yml build backend frontend
+              docker compose -f docker-compose.prod.yml up -d
+            "
+
+            echo "=== [3/4] Verifying container status & Prisma schema ==="
+            run_privileged "
+              set -e
+              cd '${DEPLOY_PATH}'
+              sleep 5
+              if docker compose -f docker-compose.prod.yml exec -T backend test -x ./node_modules/.bin/prisma; then
+                docker compose -f docker-compose.prod.yml exec -T backend ./node_modules/.bin/prisma db push --accept-data-loss
+              fi
+              BACKEND_RUNNING=\$(docker inspect -f '{{.State.Running}}' kh-cloud-backend)
+              FRONTEND_RUNNING=\$(docker inspect -f '{{.State.Running}}' kh-cloud-frontend)
+              echo \"kh-cloud-backend running: \${BACKEND_RUNNING}\"
+              echo \"kh-cloud-frontend running: \${FRONTEND_RUNNING}\"
+              if [ \"\${BACKEND_RUNNING}\" != \"true\" ] || [ \"\${FRONTEND_RUNNING}\" != \"true\" ]; then
+                docker compose -f docker-compose.prod.yml logs --tail 50 backend frontend
+                exit 1
+              fi
+              docker compose -f docker-compose.prod.yml ps
+            "
+
+            echo "=== [4/4] Cleaning up dangling Docker images ==="
+            run_privileged "docker image prune -f >/dev/null 2>&1 || true"
+
+            echo "=== Production Deployment Complete ==="
